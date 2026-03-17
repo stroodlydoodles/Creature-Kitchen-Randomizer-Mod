@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net6.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Reference Include="UnityEngine.UI">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\UnityEngine.UI.dll</HintPath>
+		</Reference>
+		<Reference Include="0Harmony">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\core\0Harmony.dll</HintPath>
+		</Reference>
+		<Reference Include="Assembly-CSharp">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\Assembly-CSharp.dll</HintPath>
+		</Reference>
+		<Reference Include="BepInEx.Core">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\core\BepInEx.Core.dll</HintPath>
+		</Reference>
+		<Reference Include="BepInEx.Unity.IL2CPP">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\core\BepInEx.Unity.IL2CPP.dll</HintPath>
+		</Reference>
+		<Reference Include="Il2CppInterop.Runtime">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\core\Il2CppInterop.Runtime.dll</HintPath>
+		</Reference>
+		<Reference Include="Il2Cppmscorlib">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\Il2Cppmscorlib.dll</HintPath>
+		</Reference>
+		<Reference Include="UnityEngine">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\UnityEngine.dll</HintPath>
+		</Reference>
+		<Reference Include="UnityEngine.CoreModule">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\UnityEngine.CoreModule.dll</HintPath>
+		</Reference>
+		<Reference Include="UnityEngine.UIModule">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\UnityEngine.UIModule.dll</HintPath>
+		</Reference>
+	</ItemGroup>
+
+</Project>
