@@ -1,8 +1,9 @@
 Creature-Kitchen-Randomizer-Mod
 
-- Install Instructions -
+Install Instructions 
 
-1.) Install BepInEX Bleeding Edge IL2CPP from here -> https://builds.bepinex.dev/projects/bepinex\_be
+
+1.) Install BepInEX Bleeding Edge IL2CPP from here -> https://builds.bepinex.dev/projects/bepinex_be
 
 2.) Place all contents of BepInEx into the root folder for Creature Kitchen
 
@@ -16,4 +17,3 @@ Creature-Kitchen-Randomizer-Mod
 
 
 Please report any bugs you find and PLEASE send me a copy of your logoutput.log file so I can see what went wrong!
-
