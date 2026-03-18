@@ -346,6 +346,18 @@ public class KeyRandomizer
     public const int CREST_LEFT = 100;
     public const int CREST_RIGHT = 101;
 
+    // Progressive crest system: first crest configured is always LEFT, second is RIGHT.
+    // Prevents duplicate-side bugs where the game's DelayHiding hides a crest whose side
+    // was already placed in the door.
+    public static int ProgressiveCrestCount = 0;
+    public static CrestHalf.CrestSide NextCrestSide()
+    {
+        var side = ProgressiveCrestCount == 0 ? CrestHalf.CrestSide.LEFT : CrestHalf.CrestSide.RIGHT;
+        ProgressiveCrestCount++;
+        Plugin.Log.LogInfo($"PROGRESSIVE CREST: Assigned {side} (count now {ProgressiveCrestCount})");
+        return side;
+    }
+
     // Creature IDs
     public const int RACCOON = 1;
     public const int MOTH = 3;
@@ -543,6 +555,7 @@ public class KeyRandomizer
         _startingKeySwapped = false;
         _shufflePhase = 0;
         AlreadyRemappedKeys.Clear();
+        ProgressiveCrestCount = 0;
         if (File.Exists(_savePath)) File.Delete(_savePath);
         Plugin.Log.LogInfo("Key randomizer reset for new game.");
     }
@@ -613,14 +626,22 @@ public class KeyRandomizer
                 if (GetEffectiveRequirements(creature).IsSubsetOf(availableDoors))
                 {
                     satisfied.Add(creature);
-                    int item = slotToItem[SlotKey(creature)];
-                    if (IsKey(item)) availableDoors.Add(item);
-                    else if (item == CREST_LEFT || item == CREST_RIGHT)
+                    string slotKey = SlotKey(creature);
+                    if (slotToItem.TryGetValue(slotKey, out int item))
                     {
-                        if (obtainedCrests.Add(item)) changed = true;
+                        if (IsKey(item)) availableDoors.Add(item);
+                        else if (item == CREST_LEFT || item == CREST_RIGHT)
+                        {
+                            if (obtainedCrests.Add(item)) changed = true;
+                        }
+                        Plugin.Log.LogInfo($"LOGIC CHECK: Creature {creature} reachable -> gives {ItemName(item)}");
+                    }
+                    else
+                    {
+                        // Creature not in shuffle (e.g. Moth in basic mode) — no key contribution
+                        Plugin.Log.LogInfo($"LOGIC CHECK: Creature {creature} reachable (not in shuffle pool)");
                     }
                     changed = true;
-                    Plugin.Log.LogInfo($"LOGIC CHECK: Creature {creature} reachable -> gives {ItemName(item)}");
                 }
             }
         }
@@ -681,9 +702,11 @@ public class KeyRandomizer
                 {
                     satisfied.Add(creature);
                     creaturesFed++;
-                    int item = slotToItem[SlotKey(creature)];
-                    if (IsKey(item)) availableDoors.Add(item);
-                    else if (item == CREST_LEFT || item == CREST_RIGHT) obtainedCrests.Add(item);
+                    if (slotToItem.TryGetValue(SlotKey(creature), out int item))
+                    {
+                        if (IsKey(item)) availableDoors.Add(item);
+                        else if (item == CREST_LEFT || item == CREST_RIGHT) obtainedCrests.Add(item);
+                    }
                     if (obtainedCrests.Count >= 2 && creaturesFed < 5) goto Reject;
                     changed = true;
                 }
@@ -2954,17 +2977,14 @@ public class KeyStartPatch
                 try
                 {
                     var go = __instance.gameObject;
-                    var side = (newItem == KeyRandomizer.CREST_LEFT)
-                        ? CrestHalf.CrestSide.LEFT : CrestHalf.CrestSide.RIGHT;
-
                     var crest = go.AddComponent<CrestHalf>();
-                    crest.m_CrestSide = side;
+                    crest.m_CrestSide = KeyRandomizer.NextCrestSide();
 
                     var item = go.GetComponent<Item>();
                     if (item != null) item.m_SecondaryFunctionality = null;
 
                     UnityEngine.Object.Destroy(__instance);
-                    Plugin.Log.LogInfo($"KEY START: Key DoorLockID {currentId} -> {KeyRandomizer.ItemName(newItem)} (crest swap)");
+                    Plugin.Log.LogInfo($"KEY START: Key DoorLockID {currentId} -> {KeyRandomizer.ItemName(newItem)} (crest swap, side={crest.m_CrestSide})");
                 }
                 catch (Exception ex) { Plugin.Log.LogError($"KEY START CREST ERROR: {ex.Message}"); }
                 return;
@@ -2995,6 +3015,9 @@ public class KeyRewardGifterPatch
     static bool _isMothGifter = false;
     static GameObject _originalPrefab = null; // to restore after spawn
     static GameObject _originalFinalPrefab = null; // to restore m_FinalRoomKeyPrefabReward
+
+    // Flag so CrestHalfSwapPatch can skip creature-reward crests (FixCrestSide handles them)
+    public static bool SpawnInProgress = false;
 
     public static void Reset() { _cachedKeyPrefab = null; _cachedCrestPrefab = null; _prefabsCached = false; }
 
@@ -3033,6 +3056,7 @@ public class KeyRewardGifterPatch
     {
         _targetItem = -1; _creatureId = -1; _keysBefore = null; _crestsBefore = null;
         _isMothGifter = false; _originalPrefab = null; _originalFinalPrefab = null;
+        SpawnInProgress = true;
         if (!Plugin.EnableKeyShuffle.Value) return;
 
         var reward = __instance.m_PrefabReward;
@@ -3144,6 +3168,7 @@ public class KeyRewardGifterPatch
         catch (Exception ex) { Plugin.Log.LogError($"KEY GIFTER ERROR: {ex.Message}\n{ex.StackTrace}"); }
 
         _targetItem = -1; _keysBefore = null; _crestsBefore = null;
+        SpawnInProgress = false;
     }
 
     static void FixKeyId()
@@ -3172,21 +3197,21 @@ public class KeyRewardGifterPatch
     static void FixCrestSide()
     {
         if (_crestsBefore == null) return;
-        var targetSide = (_targetItem == KeyRandomizer.CREST_LEFT)
-            ? CrestHalf.CrestSide.LEFT : CrestHalf.CrestSide.RIGHT;
 
         foreach (var crest in UnityEngine.Object.FindObjectsOfType<CrestHalf>())
         {
             if (!_crestsBefore.Contains(crest.GetInstanceID()))
             {
+                // Progressive crest: first crest is always LEFT, second is RIGHT
+                var newSide = KeyRandomizer.NextCrestSide();
                 var curSide = crest.GetCrestHalfSide();
-                if (curSide != targetSide)
+                if (curSide != newSide)
                 {
-                    crest.m_CrestSide = targetSide;
-                    Plugin.Log.LogInfo($"CREST SIDE FIX: Creature {_creatureId} crest {curSide} -> {targetSide}");
+                    crest.m_CrestSide = newSide;
+                    Plugin.Log.LogInfo($"CREST SIDE FIX: Creature {_creatureId} crest {curSide} -> {newSide} (progressive)");
                 }
                 else
-                    Plugin.Log.LogInfo($"CREST OK: Creature {_creatureId} crest side {curSide}");
+                    Plugin.Log.LogInfo($"CREST OK: Creature {_creatureId} crest side {curSide} (progressive)");
                 return;
             }
         }
@@ -3249,22 +3274,40 @@ public class CrestHalfSwapPatch
     {
         if (!Plugin.EnableKeyShuffle.Value || !Plugin.EnablePantryShuffle.Value) return;
 
-        // Skip creature-spawned crests (prefab instantiations have "(Clone)" in name)
-        if (__instance.gameObject.name.Contains("(Clone)")) return;
+        bool isClone = __instance.gameObject.name.Contains("(Clone)");
 
+        if (isClone)
+        {
+            // Clone crests come from creature rewards or crow rewards.
+            // Creature reward crests are handled by FixCrestSide (inside SpawnRewardItem Postfix),
+            // so skip them here to avoid double-counting the progressive counter.
+            if (KeyRewardGifterPatch.SpawnInProgress) return;
+
+            // Crow reward crest — assign progressive side
+            var newSide = KeyRandomizer.NextCrestSide();
+            __instance.m_CrestSide = newSide;
+            Plugin.Log.LogInfo($"PROGRESSIVE CREST: Crow clone '{__instance.gameObject.name}' -> {newSide}");
+            return;
+        }
+
+        // Non-clone: Oddities Room puzzle crest (vanilla scene object, LEFT side)
         var side = __instance.GetCrestHalfSide();
-
-        // Oddities Room puzzle is LEFT (0)
         if (side != CrestHalf.CrestSide.LEFT) return;
 
         Plugin.KeyRando.Initialize();
         int puzzleItem = Plugin.KeyRando.GetSlotItem(KeyRandomizer.SLOT_ODDITIES_PUZZLE);
         if (puzzleItem < 0) return;
 
-        // If the puzzle slot IS a crest half, no swap needed
-        if (puzzleItem == KeyRandomizer.CREST_LEFT || puzzleItem == KeyRandomizer.CREST_RIGHT) return;
+        // If the puzzle slot IS a crest half, assign progressive side
+        if (puzzleItem == KeyRandomizer.CREST_LEFT || puzzleItem == KeyRandomizer.CREST_RIGHT)
+        {
+            var newSide = KeyRandomizer.NextCrestSide();
+            __instance.m_CrestSide = newSide;
+            Plugin.Log.LogInfo($"PROGRESSIVE CREST: Oddities puzzle -> {newSide}");
+            return;
+        }
 
-        // Swap: replace CrestHalf with Key on this gameobject
+        // Puzzle slot is a key — swap CrestHalf component to Key
         if (!KeyRandomizer.IsKey(puzzleItem)) return;
 
         try
