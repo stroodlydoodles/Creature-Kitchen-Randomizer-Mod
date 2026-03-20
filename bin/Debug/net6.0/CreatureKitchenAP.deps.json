@@ -14,6 +14,7 @@
           "BepInEx.Unity.IL2CPP": "6.0.0.0",
           "Il2CppInterop.Runtime": "1.5.0.0",
           "Il2Cppmscorlib": "4.0.0.0",
+          "Unity.TextMeshPro": "0.0.0.0",
           "UnityEngine.CoreModule": "0.0.0.0",
           "UnityEngine": "0.0.0.0",
           "UnityEngine.UI": "1.0.0.0",
@@ -67,6 +68,14 @@
         "runtime": {
           "Il2Cppmscorlib.dll": {
             "assemblyVersion": "4.0.0.0",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Unity.TextMeshPro/0.0.0.0": {
+        "runtime": {
+          "Unity.TextMeshPro.dll": {
+            "assemblyVersion": "0.0.0.0",
             "fileVersion": "0.0.0.0"
           }
         }
@@ -180,14 +189,6 @@
           "Mono.Cecil.dll": {
             "assemblyVersion": "0.11.4.0",
             "fileVersion": "0.11.4.0"
-          }
-        }
-      },
-      "Unity.TextMeshPro/0.0.0.0": {
-        "runtime": {
-          "Unity.TextMeshPro.dll": {
-            "assemblyVersion": "0.0.0.0",
-            "fileVersion": "0.0.0.0"
           }
         }
       },
@@ -391,6 +392,14 @@
           }
         }
       },
+      "UnityEngine.TextCoreFontEngineModule/0.0.0.0": {
+        "runtime": {
+          "UnityEngine.TextCoreFontEngineModule.dll": {
+            "assemblyVersion": "0.0.0.0",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
       "UnityEngine.TextCoreTextEngineModule/0.0.0.0": {
         "runtime": {
           "UnityEngine.TextCoreTextEngineModule.dll": {
@@ -412,14 +421,6 @@
           "Iced.dll": {
             "assemblyVersion": "1.21.0.0",
             "fileVersion": "1.21.0.0"
-          }
-        }
-      },
-      "UnityEngine.TextCoreFontEngineModule/0.0.0.0": {
-        "runtime": {
-          "UnityEngine.TextCoreFontEngineModule.dll": {
-            "assemblyVersion": "0.0.0.0",
-            "fileVersion": "0.0.0.0"
           }
         }
       },
@@ -621,6 +622,11 @@
       "serviceable": false,
       "sha512": ""
     },
+    "Unity.TextMeshPro/0.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
     "UnityEngine.CoreModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
@@ -687,11 +693,6 @@
       "sha512": ""
     },
     "Mono.Cecil/0.11.4.0": {
-      "type": "reference",
-      "serviceable": false,
-      "sha512": ""
-    },
-    "Unity.TextMeshPro/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""
@@ -821,6 +822,11 @@
       "serviceable": false,
       "sha512": ""
     },
+    "UnityEngine.TextCoreFontEngineModule/0.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
     "UnityEngine.TextCoreTextEngineModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
@@ -832,11 +838,6 @@
       "sha512": ""
     },
     "Iced/1.21.0.0": {
-      "type": "reference",
-      "serviceable": false,
-      "sha512": ""
-    },
-    "UnityEngine.TextCoreFontEngineModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""

@@ -1,20 +1,24 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using TMPro;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.UI;
 
 namespace CreatureKitchenAP;
 
-[BepInPlugin("CreatureKitchenRando", "Creature Kitchen AP", "0.1.0")]
+[BepInPlugin("CreatureKitchenRando", "Creature Kitchen Randomizer", "0.2.0")]
 public class Plugin : BasePlugin
 {
+    public const string MOD_NAME = "Creature Kitchen Randomizer";
+    public const string VERSION = "0.2.0";
+
     internal static new BepInEx.Logging.ManualLogSource Log = null!;
     internal static CardRandomizer Randomizer = null!;
     internal static KeyRandomizer KeyRando = null!;
@@ -35,7 +39,7 @@ public class Plugin : BasePlugin
     public override void Load()
     {
         Log = base.Log;
-        Log.LogInfo("Creature Kitchen AP loaded!");
+        Log.LogInfo($"{MOD_NAME} v{VERSION} loaded!");
 
         EnableCardShuffle = Config.Bind("Shuffling", "EnableCardShuffle", true, "Shuffle recipe cards across locations.");
         EnableMistakeSystem = Config.Bind("Shuffling", "EnableMistakeSystem", true, "Force Mistake when cooking uncollected recipe.");
@@ -2020,10 +2024,11 @@ public static class RecipeLogic
             using var w = new StreamWriter(path);
 
             w.WriteLine("╔══════════════════════════════════════════════════════════════╗");
-            w.WriteLine("║            CREATURE KITCHEN AP — SPOILER LOG                ║");
+            w.WriteLine("║            CREATURE KITCHEN RANDOMIZER — SPOILER LOG        ║");
             w.WriteLine("╚══════════════════════════════════════════════════════════════╝");
             w.WriteLine();
             bool fullShuffle = Plugin.EnablePantryShuffle.Value;
+            w.WriteLine($"  Version:         {Plugin.VERSION}");
             w.WriteLine($"  Seed:            {Plugin.ActiveSeed}");
             if (fullShuffle && Plugin.KeyRando.ShufflePhase > 0)
             {
@@ -2728,13 +2733,28 @@ public class IngredientRandomizer
 [HarmonyPatch(typeof(NewGameButton), nameof(NewGameButton.StartNewGame))]
 public class NewGamePatch
 {
+    // Guard against double-fire: the game's UI can trigger StartNewGame multiple
+    // times in one frame (persistent Inspector listeners + our onClick.Invoke()).
+    // The second call would overwrite the correct shuffle with a random seed.
+    static bool _newGameStarted = false;
+    public static void AllowNewGame() { _newGameStarted = false; }
+
     static void Postfix()
     {
+        if (_newGameStarted)
+        {
+            Plugin.Log.LogInfo("New game button pressed! (duplicate call, ignoring)");
+            return;
+        }
+        _newGameStarted = true;
+
         Plugin.Log.LogInfo("New game button pressed!");
         Plugin.Randomizer.PrepareForNewGame();
         Plugin.KeyRando.PrepareForNewGame();
         Plugin.IngredientRando.PrepareForNewGame();
         IngredientSwapPatch.Reset();
+        KeyRewardGifterPatch.Reset();
+        CrestHalfSwapPatch.ResetTracking();
 
         // Determine seed: resume uses saved seed, new game uses config or random
         int seed;
@@ -2774,6 +2794,60 @@ public class NewGamePatch
     }
 }
 
+[HarmonyPatch(typeof(MainMenuSetup), nameof(MainMenuSetup.Start))]
+public class MainMenuVersionPatch
+{
+    static void Postfix(MainMenuSetup __instance)
+    {
+        try
+        {
+            // Find the main menu canvas from the MainMenuSetup's own hierarchy
+            var canvas = __instance.GetComponentInParent<Canvas>();
+            if (canvas == null)
+            {
+                // Fallback: search for "MainMenuCanvas" by name
+                foreach (var c in Resources.FindObjectsOfTypeAll<Canvas>())
+                {
+                    if (c.gameObject.name.Contains("MainMenu"))
+                    {
+                        canvas = c;
+                        break;
+                    }
+                }
+            }
+            if (canvas == null)
+            {
+                Plugin.Log.LogWarning("VERSION LABEL: No main menu canvas found");
+                return;
+            }
+
+            // Create version label GameObject
+            var go = new GameObject("ModVersionLabel");
+            go.transform.SetParent(canvas.transform, false);
+
+            var tmp = go.AddComponent<TextMeshProUGUI>();
+            tmp.text = $"{Plugin.MOD_NAME} v{Plugin.VERSION}";
+            tmp.fontSize = 16;
+            tmp.color = new Color(1f, 1f, 1f, 0.5f);
+            tmp.alignment = TextAlignmentOptions.BottomRight;
+            tmp.raycastTarget = false;
+
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = new Vector2(1, 0);
+            rect.anchorMax = new Vector2(1, 0);
+            rect.pivot = new Vector2(1, 0);
+            rect.anchoredPosition = new Vector2(-20, 10);
+            rect.sizeDelta = new Vector2(400, 30);
+
+            Plugin.Log.LogInfo($"VERSION LABEL: Added '{tmp.text}' to main menu");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"VERSION LABEL ERROR: {ex.Message}");
+        }
+    }
+}
+
 [HarmonyPatch(typeof(DisableMenuButtons), nameof(DisableMenuButtons.EnableButtons))]
 public class MainMenuResumePatch
 {
@@ -2789,6 +2863,9 @@ public class MainMenuResumePatch
 
     static void Postfix()
     {
+        // Reset the double-fire guard so a new game can be started from this menu
+        NewGamePatch.AllowNewGame();
+
         if (_rewired) return;
 
         if (!File.Exists(Plugin.SeedPath)) { _rewired = true; return; }
@@ -2979,6 +3056,9 @@ public class KeyStartPatch
                     var go = __instance.gameObject;
                     var crest = go.AddComponent<CrestHalf>();
                     crest.m_CrestSide = KeyRandomizer.NextCrestSide();
+
+                    // Track so CrestHalfSwapPatch skips this when CrestHalf.Start fires
+                    CrestHalfSwapPatch.TrackConverted(crest.GetInstanceID());
 
                     var item = go.GetComponent<Item>();
                     if (item != null) item.m_SecondaryFunctionality = null;
@@ -3212,6 +3292,10 @@ public class KeyRewardGifterPatch
                 }
                 else
                     Plugin.Log.LogInfo($"CREST OK: Creature {_creatureId} crest side {curSide} (progressive)");
+
+                // Track so CrestHalfSwapPatch skips this when CrestHalf.Start fires later
+                // (Unity defers Start, so SpawnInProgress is already false by then)
+                CrestHalfSwapPatch.TrackConverted(crest.GetInstanceID());
                 return;
             }
         }
@@ -3270,20 +3354,31 @@ public class CrowRewardPatch
 [HarmonyPatch(typeof(CrestHalf), nameof(CrestHalf.Start))]
 public class CrestHalfSwapPatch
 {
+    // CrestHalf instances already assigned a progressive side by other patches.
+    // Unity defers CrestHalf.Start(), so it fires AFTER the code that created/fixed
+    // the crest. Without this tracking, CrestHalfSwapPatch would call NextCrestSide()
+    // a second time on the same crest. Sources:
+    //   - KeyStartPatch: table key → crest conversion via AddComponent<CrestHalf>
+    //   - FixCrestSide: creature reward crests fixed in SpawnRewardItem Postfix
+    static HashSet<int> _convertedCrestIds = new();
+    public static void TrackConverted(int instanceId) { _convertedCrestIds.Add(instanceId); }
+    public static void ResetTracking() { _convertedCrestIds.Clear(); }
+
     static void Postfix(CrestHalf __instance)
     {
         if (!Plugin.EnableKeyShuffle.Value || !Plugin.EnablePantryShuffle.Value) return;
+
+        // Skip crests already assigned a progressive side by KeyStartPatch or FixCrestSide
+        if (_convertedCrestIds.Contains(__instance.GetInstanceID())) return;
 
         bool isClone = __instance.gameObject.name.Contains("(Clone)");
 
         if (isClone)
         {
             // Clone crests come from creature rewards or crow rewards.
-            // Creature reward crests are handled by FixCrestSide (inside SpawnRewardItem Postfix),
-            // so skip them here to avoid double-counting the progressive counter.
-            if (KeyRewardGifterPatch.SpawnInProgress) return;
-
-            // Crow reward crest — assign progressive side
+            // Creature reward crests are tracked via _convertedCrestIds (registered by
+            // FixCrestSide in the SpawnRewardItem Postfix), so they're already skipped above.
+            // Any clone reaching here is a Crow reward — assign progressive side.
             var newSide = KeyRandomizer.NextCrestSide();
             __instance.m_CrestSide = newSide;
             Plugin.Log.LogInfo($"PROGRESSIVE CREST: Crow clone '{__instance.gameObject.name}' -> {newSide}");

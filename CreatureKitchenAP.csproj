@@ -37,6 +37,9 @@
 		<Reference Include="UnityEngine.UIModule">
 			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\UnityEngine.UIModule.dll</HintPath>
 		</Reference>
+		<Reference Include="Unity.TextMeshPro">
+			<HintPath>Z:\SteamLibrary\steamapps\common\Creature Kitchen\BepInEx\interop\Unity.TextMeshPro.dll</HintPath>
+		</Reference>
 	</ItemGroup>
 
 </Project>
