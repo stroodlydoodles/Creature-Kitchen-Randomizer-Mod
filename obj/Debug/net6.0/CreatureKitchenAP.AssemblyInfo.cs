@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("CreatureKitchenAP")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+57562248ee9c24a3d513b0407a861e85dbdc39c5")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a5b07fb74d00660f54a2a410012b946f318c9770")]
 [assembly: System.Reflection.AssemblyProductAttribute("CreatureKitchenAP")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CreatureKitchenAP")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

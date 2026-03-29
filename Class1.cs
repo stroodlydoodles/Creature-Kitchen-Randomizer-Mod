@@ -1,7 +1,13 @@
-﻿using BepInEx;
+﻿using Archipelago.MultiClient.Net;
+using Archipelago.MultiClient.Net.Enums;
+using Archipelago.MultiClient.Net.Helpers;
+using Archipelago.MultiClient.Net.Models;
+using Archipelago.MultiClient.Net.Packets;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
+using Il2CppInterop.Runtime.Injection;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -17,12 +23,13 @@ namespace CreatureKitchenAP;
 public class Plugin : BasePlugin
 {
     public const string MOD_NAME = "Creature Kitchen Randomizer";
-    public const string VERSION = "0.2.0";
+    public const string VERSION = "0.5.0";
 
     internal static new BepInEx.Logging.ManualLogSource Log = null!;
     internal static CardRandomizer Randomizer = null!;
     internal static KeyRandomizer KeyRando = null!;
     internal static IngredientRandomizer IngredientRando = null!;
+    internal static ChaosRandomizer ChaosRando = null!;
     internal static bool IsNewGame = false;
     internal static bool IsResumeAsNewGame = false;
 
@@ -31,7 +38,16 @@ public class Plugin : BasePlugin
     internal static ConfigEntry<bool> EnableKeyShuffle = null!;
     internal static ConfigEntry<bool> EnablePantryShuffle = null!;
     internal static ConfigEntry<bool> EnableIngredientShuffle = null!;
+    internal static ConfigEntry<bool> EnableChaosMode = null!;
     internal static ConfigEntry<int> SeedConfig = null!;
+
+    // Archipelago config
+    internal static ConfigEntry<bool> EnableArchipelago = null!;
+    internal static ConfigEntry<string> APServer = null!;
+    internal static ConfigEntry<int> APPort = null!;
+    internal static ConfigEntry<string> APSlotName = null!;
+    internal static ConfigEntry<string> APPassword = null!;
+    internal static ArchipelagoClient APClient = null!;
 
     internal static int ActiveSeed = 0;
     internal static string SeedPath = null!;
@@ -46,18 +62,33 @@ public class Plugin : BasePlugin
         EnableKeyShuffle = Config.Bind("Shuffling", "EnableKeyShuffle", true, "Shuffle which key each creature rewards. This doesn't include Pantry, Fridge or either Crest half.");
         EnablePantryShuffle = Config.Bind("Shuffling", "EnablePantryShuffle", false, "Include Pantry, Fridge keys, and both Crest Halves in shuffle pool (Hard Mode). Starting table key becomes a random key. Requires EnableKeyShuffle.");
         EnableIngredientShuffle = Config.Bind("Shuffling", "EnableIngredientShuffle", false, "Shuffle finite ingredient locations across the map. Excludes all Mushrooms, Bread, and Water.");
+        EnableChaosMode = Config.Bind("Shuffling", "EnableChaosMode", false, "CHAOS MODE: All items (keys, cards, ingredients, crests) can appear at ANY location. Overrides all other shuffle settings when enabled.");
         SeedConfig = Config.Bind("Shuffling", "Seed", 0, "Seed for randomization (0 = random seed each new game). Same seed always produces the same shuffle.");
 
-        Log.LogInfo($"Config: CardShuffle={EnableCardShuffle.Value}, MistakeSystem={EnableMistakeSystem.Value}, KeyShuffle={EnableKeyShuffle.Value}, PantryShuffle={EnablePantryShuffle.Value}, IngredientShuffle={EnableIngredientShuffle.Value}, Seed={SeedConfig.Value}");
+        // Archipelago config
+        EnableArchipelago = Config.Bind("Archipelago", "EnableArchipelago", false, "Connect to an Archipelago server for multiworld randomization. Overrides all other modes.");
+        APServer = Config.Bind("Archipelago", "Server", "localhost", "Archipelago server address.");
+        APPort = Config.Bind("Archipelago", "Port", 38281, "Archipelago server port.");
+        APSlotName = Config.Bind("Archipelago", "SlotName", "Player1", "Your slot/player name for the Archipelago session.");
+        APPassword = Config.Bind("Archipelago", "Password", "", "Password for the Archipelago room (leave empty if none).");
+
+        Log.LogInfo($"Config: CardShuffle={EnableCardShuffle.Value}, MistakeSystem={EnableMistakeSystem.Value}, KeyShuffle={EnableKeyShuffle.Value}, PantryShuffle={EnablePantryShuffle.Value}, IngredientShuffle={EnableIngredientShuffle.Value}, ChaosMode={EnableChaosMode.Value}, AP={EnableArchipelago.Value}, Seed={SeedConfig.Value}");
 
         string mappingPath = Path.Combine(Paths.PluginPath, "CK_AP_CardMapping.json");
         string collectedPath = Path.Combine(Paths.PluginPath, "CK_AP_CollectedRecipes.json");
         string keyMappingPath = Path.Combine(Paths.PluginPath, "CK_AP_KeyMapping.json");
         string ingredientMappingPath = Path.Combine(Paths.PluginPath, "CK_AP_IngredientMapping.json");
+        string chaosMappingPath = Path.Combine(Paths.PluginPath, "CK_AP_ChaosMapping.json");
         SeedPath = Path.Combine(Paths.PluginPath, "CK_AP_Seed.txt");
         Randomizer = new CardRandomizer(mappingPath, collectedPath);
         KeyRando = new KeyRandomizer(keyMappingPath);
         IngredientRando = new IngredientRandomizer(ingredientMappingPath);
+        ChaosRando = new ChaosRandomizer(chaosMappingPath);
+        APClient = new ArchipelagoClient();
+
+        // Register IL2CPP types for update loop and notifications
+        ClassInjector.RegisterTypeInIl2Cpp<APUpdateRunner>();
+        ClassInjector.RegisterTypeInIl2Cpp<APNotificationUI>();
 
         var harmony = new Harmony("CreatureKitchenRando");
         harmony.PatchAll();
@@ -87,6 +118,7 @@ public class CardRandomizer
     }
 
     public void SetRng(System.Random rng) { _rng = rng; }
+    public void SuppressForChaos() { _initialized = true; }
 
     public void PrepareForNewGame()
     {
@@ -512,6 +544,7 @@ public class KeyRandomizer
     public KeyRandomizer(string savePath) { _savePath = savePath; }
 
     public void SetRng(System.Random rng) { _rng = rng; }
+    public void SuppressForChaos() { _initialized = true; }
 
     public int GetStartingTableKey() => _startingTableKey;
 
@@ -1610,7 +1643,7 @@ public static class RecipeLogic
     // ===================================================================
 
     // Ingredient cost for a recipe (only finite/trackable ingredients)
-    struct IC { public string N; public int A; public bool W; } // Name, Amount, Whole
+    internal struct IC { public string N; public int A; public bool W; } // Name, Amount, Whole
     static IC S(string n, int a) => new IC { N = n, A = a };
     static IC WH(string n, int a) => new IC { N = n, A = a, W = true };
 
@@ -1660,7 +1693,7 @@ public static class RecipeLogic
     // Finite ingredient costs per recipe (parallel to Recipes[], omitting always-infinite ingredients)
     // Always infinite: Steak, Milk, Egg, Butter, Strawberry, Lettuce, Chicken, Fish, Bacon
     // Potato/Ice excluded from costs when recipe has D_PANTRY/D_FREEZE (not reachable pre-Pantry anyway)
-    static readonly IC[][] FiniteCosts = new IC[][]
+    internal static readonly IC[][] FiniteCosts = new IC[][]
     {
         new[] { S("Bread",2) },                                                 //  0: EggSandwich
         new[] { S("Bread",2), S("Cheese",1) },                                 //  1: GrilledCheese
@@ -1703,7 +1736,7 @@ public static class RecipeLogic
         new[] { S("Cereal",1) },                                               // 38: FortunateGems
     };
 
-    static readonly IC[][] DefaultFiniteCosts = new IC[][]
+    internal static readonly IC[][] DefaultFiniteCosts = new IC[][]
     {
         new[] { S("Bread",1) },                         // Toast
         new[] { S("Flour",1), S("Water",1), S("MapleSyrup",1) },     // Pancakes
@@ -2357,6 +2390,7 @@ public class IngredientRandomizer
 
     public IngredientRandomizer(string savePath) { _savePath = savePath; }
     public void SetRng(System.Random rng) { _rng = rng; }
+    public void SuppressForChaos() { _initialized = true; }
     public bool HasMapping => _shuffled != null && _shuffled.Length > 0;
     public int[] GetShuffled() => _shuffled;
 
@@ -2727,6 +2761,2200 @@ public class IngredientRandomizer
 }
 
 // =====================================================================
+// Chaos Mode Randomizer — Generates and manages cross-pool assignments
+// =====================================================================
+public class ChaosRandomizer
+{
+    private int[] _assignment;      // _assignment[loc] = item index
+    private int[] _reverseMap;      // _reverseMap[item] = loc index
+    private bool _initialized = false;
+    private string _savePath;
+    private System.Random _rng;
+
+    // Collected recipe cards tracked for the mistake system in chaos mode
+    private HashSet<int> _collectedCards = new();       // recipe indices (0-38)
+    private HashSet<string> _collectedCardNames = new(); // recipe name strings
+
+    public ChaosRandomizer(string savePath) { _savePath = savePath; }
+    public void SetRng(System.Random rng) { _rng = rng; }
+    public bool HasMapping => _assignment != null && _assignment.Length > 0;
+
+    public void PrepareForNewGame()
+    {
+        _assignment = null;
+        _reverseMap = null;
+        _initialized = false;
+        _collectedCards.Clear();
+        _collectedCardNames.Clear();
+        _chaosTypeCounter.Clear();
+        if (File.Exists(_savePath)) File.Delete(_savePath);
+        Plugin.Log.LogInfo("Chaos randomizer reset for new game.");
+    }
+
+    public void Initialize()
+    {
+        if (_initialized) return;
+
+        if (File.Exists(_savePath) && LoadMapping())
+        {
+            _initialized = true;
+            return;
+        }
+
+        Plugin.Log.LogInfo("CHAOS INIT: Generating validated chaos shuffle...");
+
+        if (_rng == null)
+        {
+            Plugin.Log.LogWarning("CHAOS INIT: No RNG set, using random seed");
+            _rng = new System.Random();
+        }
+
+        int attempts = 0;
+        const int MAX_ATTEMPTS = 200;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        while (attempts < MAX_ATTEMPTS)
+        {
+            attempts++;
+
+            // Fisher-Yates shuffle of 0..76
+            var candidate = new int[ChaosValidator.TOTAL];
+            for (int i = 0; i < ChaosValidator.TOTAL; i++) candidate[i] = i;
+            for (int i = candidate.Length - 1; i > 0; i--)
+            {
+                int j = _rng.Next(i + 1);
+                (candidate[i], candidate[j]) = (candidate[j], candidate[i]);
+            }
+
+            if (ChaosValidator.IsCompletable(candidate))
+            {
+                _assignment = candidate;
+                BuildReverseMap();
+                sw.Stop();
+
+                Plugin.Log.LogInfo($"CHAOS SHUFFLE: Valid assignment found in {attempts} attempt(s) ({sw.ElapsedMilliseconds}ms)");
+                LogAssignment();
+
+                _initialized = true;
+                SaveMapping();
+                GenerateSpoilerLog();
+                return;
+            }
+        }
+
+        sw.Stop();
+        Plugin.Log.LogError($"CHAOS SHUFFLE: Failed after {MAX_ATTEMPTS} attempts ({sw.ElapsedMilliseconds}ms)! Chaos mode will not function.");
+        _initialized = true; // Don't retry endlessly
+    }
+
+    private void BuildReverseMap()
+    {
+        _reverseMap = new int[ChaosValidator.TOTAL];
+        for (int loc = 0; loc < ChaosValidator.TOTAL; loc++)
+            _reverseMap[_assignment[loc]] = loc;
+    }
+
+    // ---------------------------------------------------------------
+    // Lookups — used by runtime patches
+    // ---------------------------------------------------------------
+
+    /// <summary>Get the item index placed at a location.</summary>
+    public int GetItemAtLocation(int loc)
+    {
+        if (_assignment == null || loc < 0 || loc >= _assignment.Length) return -1;
+        return _assignment[loc];
+    }
+
+    /// <summary>Get the location index where an item was placed.</summary>
+    public int GetLocationOfItem(int item)
+    {
+        if (_reverseMap == null || item < 0 || item >= _reverseMap.Length) return -1;
+        return _reverseMap[item];
+    }
+
+    /// <summary>Get the item at a creature reward location by creature ID.</summary>
+    public int GetCreatureRewardItem(int creatureId)
+    {
+        for (int i = 0; i < ChaosValidator.CreatureLocOrder.Length; i++)
+        {
+            if (ChaosValidator.CreatureLocOrder[i] == creatureId)
+                return GetItemAtLocation(ChaosValidator.LOC_CREATURE_BASE + i);
+        }
+        return -1;
+    }
+
+    /// <summary>Get the item at a card spot by recipe index (0-38).</summary>
+    public int GetItemAtCardSpot(int recipeIdx)
+    {
+        return GetItemAtLocation(ChaosValidator.LOC_CARD_BASE + recipeIdx);
+    }
+
+    /// <summary>Get the item at an ingredient spot by slot index (0-25).</summary>
+    public int GetItemAtIngredientSpot(int slotIdx)
+    {
+        return GetItemAtLocation(ChaosValidator.LOC_ING_BASE + slotIdx);
+    }
+
+    /// <summary>Get the item at the starting table (LOC_TABLE).</summary>
+    public int GetTableItem()
+    {
+        return GetItemAtLocation(ChaosValidator.LOC_TABLE);
+    }
+
+    /// <summary>Get the item at the oddities puzzle (LOC_ODDITIES).</summary>
+    public int GetOdditiesItem()
+    {
+        return GetItemAtLocation(ChaosValidator.LOC_ODDITIES);
+    }
+
+    // ---------------------------------------------------------------
+    // Ingredient slot index resolution (type counter)
+    // ---------------------------------------------------------------
+    private Dictionary<int, int> _chaosTypeCounter = new();
+
+    /// <summary>
+    /// Given an original ingredient type, resolve which slot index (0-25) this is
+    /// by counting how many of that type we've seen so far.
+    /// Returns -1 on overflow.
+    /// </summary>
+    public int ResolveIngredientSlotIndex(int originalType)
+    {
+        int counter = _chaosTypeCounter.GetValueOrDefault(originalType, 0);
+        _chaosTypeCounter[originalType] = counter + 1;
+
+        int seen = 0;
+        for (int i = 0; i < IngredientRandomizer.TOTAL_SLOTS; i++)
+        {
+            if (IngredientRandomizer.Slots[i].OrigType == originalType)
+            {
+                if (seen == counter) return i;
+                seen++;
+            }
+        }
+        return -1; // Overflow
+    }
+
+    // ---------------------------------------------------------------
+    // Recipe card collection tracking (for mistake system)
+    // ---------------------------------------------------------------
+
+    public void CollectCard(int recipeIdx)
+    {
+        if (recipeIdx < 0 || recipeIdx >= RecipeLogic.Recipes.Length) return;
+        if (_collectedCards.Add(recipeIdx))
+        {
+            string name = RecipeLogic.Recipes[recipeIdx].Name;
+            _collectedCardNames.Add(name);
+            Plugin.Log.LogInfo($"CHAOS COLLECTED: {name} (card #{recipeIdx}, {_collectedCards.Count} total)");
+        }
+    }
+
+    public bool IsCardCollected(string recipeName)
+    {
+        return _collectedCardNames.Contains(recipeName);
+    }
+
+    // ---------------------------------------------------------------
+    // Logging
+    // ---------------------------------------------------------------
+
+    private void LogAssignment()
+    {
+        Plugin.Log.LogInfo($"  Table:           {ChaosValidator.ItemName(_assignment[ChaosValidator.LOC_TABLE])}");
+        Plugin.Log.LogInfo($"  Crow:            {ChaosValidator.ItemName(_assignment[ChaosValidator.LOC_CROW])}");
+        Plugin.Log.LogInfo($"  Oddities Puzzle: {ChaosValidator.ItemName(_assignment[ChaosValidator.LOC_ODDITIES])}");
+
+        for (int i = 0; i < ChaosValidator.CreatureLocOrder.Length; i++)
+        {
+            int cid = ChaosValidator.CreatureLocOrder[i];
+            string cname = KeyRandomizer.CreatureNames.TryGetValue(cid, out string n) ? n : $"Creature{cid}";
+            Plugin.Log.LogInfo($"  {(cname + ":").PadRight(17)}{ChaosValidator.ItemName(_assignment[ChaosValidator.LOC_CREATURE_BASE + i])}");
+        }
+
+        int keysAtCards = 0, cardsAtCreatures = 0, ingsAtCards = 0;
+        for (int loc = 0; loc < ChaosValidator.TOTAL; loc++)
+        {
+            int item = _assignment[loc];
+            if (ChaosValidator.IsKeyItem(item) && loc >= ChaosValidator.LOC_CARD_BASE && loc < ChaosValidator.LOC_ING_BASE) keysAtCards++;
+            if (ChaosValidator.IsCardItem(item) && loc >= ChaosValidator.LOC_CREATURE_BASE && loc < ChaosValidator.LOC_CARD_BASE) cardsAtCreatures++;
+            if (ChaosValidator.IsIngredientItem(item) && loc >= ChaosValidator.LOC_CARD_BASE && loc < ChaosValidator.LOC_ING_BASE) ingsAtCards++;
+        }
+        Plugin.Log.LogInfo($"  Cross-pool: {keysAtCards} keys at card spots, {cardsAtCreatures} cards as creature rewards, {ingsAtCards} ingredients at card spots");
+    }
+
+    // ---------------------------------------------------------------
+    // Spoiler Log
+    // ---------------------------------------------------------------
+
+    private void GenerateSpoilerLog()
+    {
+        if (_assignment == null) return;
+        try
+        {
+            string path = Path.Combine(BepInEx.Paths.PluginPath, "CK_AP_SpoilerLog.txt");
+            using var w = new StreamWriter(path);
+
+            w.WriteLine("╔══════════════════════════════════════════════════════════════╗");
+            w.WriteLine("║      CREATURE KITCHEN RANDOMIZER — CHAOS SPOILER LOG        ║");
+            w.WriteLine("╚══════════════════════════════════════════════════════════════╝");
+            w.WriteLine();
+            w.WriteLine($"  Version:         {Plugin.VERSION}");
+            w.WriteLine($"  Seed:            {Plugin.ActiveSeed}");
+            w.WriteLine($"  Mode:            CHAOS (full cross-pool)");
+            w.WriteLine();
+
+            // === Creature Rewards ===
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine("  CREATURE REWARDS");
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine();
+            w.WriteLine($"  {"Source".PadRight(22)}{"Item".PadRight(35)}Type");
+            w.WriteLine($"  {"------".PadRight(22)}{"----".PadRight(35)}----");
+
+            WriteLocLine(w, ChaosValidator.LOC_TABLE, "Starting Table");
+            WriteLocLine(w, ChaosValidator.LOC_CROW, "Crow");
+            WriteLocLine(w, ChaosValidator.LOC_ODDITIES, "Oddities Puzzle");
+            for (int i = 0; i < ChaosValidator.CreatureLocOrder.Length; i++)
+            {
+                int cid = ChaosValidator.CreatureLocOrder[i];
+                string cname = KeyRandomizer.CreatureNames.TryGetValue(cid, out string n) ? n : $"Creature{cid}";
+                WriteLocLine(w, ChaosValidator.LOC_CREATURE_BASE + i, cname);
+            }
+            w.WriteLine();
+
+            // === Card Spot Contents ===
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine("  CARD SPOT CONTENTS");
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine();
+
+            for (int ri = 0; ri < RecipeLogic.Recipes.Length; ri++)
+            {
+                int loc = ChaosValidator.LOC_CARD_BASE + ri;
+                int item = _assignment[loc];
+                string spotName = CleanRecipeName(RecipeLogic.Recipes[ri].Name);
+                string itemName = ChaosValidator.ItemName(item);
+                string typeName = ItemTypeName(item);
+                string doorInfo = RecipeLogic.Recipes[ri].LocDoors.Length > 0
+                    ? string.Join("+", RecipeLogic.Recipes[ri].LocDoors.Select(d =>
+                        KeyRandomizer.DoorNames.TryGetValue(d, out string dn) ? dn : $"Door{d}"))
+                    : "Kitchen";
+                w.WriteLine($"  [{doorInfo}] {spotName.PadRight(30)} -> {CleanItemName(itemName).PadRight(30)} ({typeName})");
+            }
+            w.WriteLine();
+
+            // === Ingredient Spot Contents ===
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine("  INGREDIENT SPOT CONTENTS");
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine();
+
+            for (int si = 0; si < IngredientRandomizer.TOTAL_SLOTS; si++)
+            {
+                int loc = ChaosValidator.LOC_ING_BASE + si;
+                int item = _assignment[loc];
+                int origType = IngredientRandomizer.Slots[si].OrigType;
+                int door = IngredientRandomizer.Slots[si].Door;
+                string origName = IngredientRandomizer.TypeToName.TryGetValue(origType, out string on) ? on : $"?{origType}";
+                string doorName = door > 0
+                    ? KeyRandomizer.DoorNames.GetValueOrDefault(door, $"Door{door}")
+                    : "Kitchen";
+                string itemName = ChaosValidator.ItemName(item);
+                string typeName = ItemTypeName(item);
+                w.WriteLine($"  [{doorName}] {origName.PadRight(20)} -> {CleanItemName(itemName).PadRight(30)} ({typeName})");
+            }
+            w.WriteLine();
+
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+            w.WriteLine("  END OF CHAOS SPOILER LOG");
+            w.WriteLine("══════════════════════════════════════════════════════════════");
+
+            Plugin.Log.LogInfo($"CHAOS SPOILER LOG: Written to {path}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"Failed to write chaos spoiler log: {ex.Message}");
+        }
+    }
+
+    private void WriteLocLine(StreamWriter w, int loc, string locName)
+    {
+        int item = _assignment[loc];
+        string itemName = CleanItemName(ChaosValidator.ItemName(item));
+        string typeName = ItemTypeName(item);
+        w.WriteLine($"  {locName.PadRight(22)}{itemName.PadRight(35)}{typeName}");
+    }
+
+    static string ItemTypeName(int item)
+    {
+        if (ChaosValidator.IsKeyItem(item)) return "KEY";
+        if (ChaosValidator.IsCrestItem(item)) return "CREST";
+        if (ChaosValidator.IsCardItem(item)) return "CARD";
+        if (ChaosValidator.IsIngredientItem(item)) return "INGREDIENT";
+        return "?";
+    }
+
+    static string CleanRecipeName(string name)
+    {
+        string s = name;
+        if (s.StartsWith("Recipe_")) s = s.Substring(7);
+        if (s.EndsWith("Name")) s = s.Substring(0, s.Length - 4);
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (i > 0 && char.IsUpper(s[i]) && !char.IsUpper(s[i - 1]))
+                sb.Append(' ');
+            sb.Append(s[i]);
+        }
+        return sb.ToString();
+    }
+
+    static string CleanItemName(string name)
+    {
+        if (name.StartsWith("Recipe_")) return CleanRecipeName(name);
+        return name;
+    }
+
+    // ---------------------------------------------------------------
+    // Save / Load
+    // ---------------------------------------------------------------
+
+    public void SaveMapping()
+    {
+        if (_assignment == null) return;
+        try
+        {
+            var lines = new List<string> { "{" };
+            for (int i = 0; i < _assignment.Length; i++)
+            {
+                string comma = i < _assignment.Length - 1 ? "," : "";
+                lines.Add($"  \"{i}\": \"{_assignment[i]}\"{comma}");
+            }
+            lines.Add("}");
+            File.WriteAllLines(_savePath, lines);
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"Failed to save chaos mapping: {ex.Message}"); }
+    }
+
+    public bool LoadMapping()
+    {
+        try
+        {
+            if (!File.Exists(_savePath)) return false;
+            string json = File.ReadAllText(_savePath);
+            var mapping = new Dictionary<int, int>();
+            foreach (var line in json.Split('\n'))
+            {
+                var trimmed = line.Trim().TrimEnd(',');
+                if (trimmed.StartsWith("\""))
+                {
+                    int ci = trimmed.IndexOf(':');
+                    if (ci > 0)
+                    {
+                        string key = trimmed.Substring(0, ci).Trim().Trim('"');
+                        string value = trimmed.Substring(ci + 1).Trim().Trim('"');
+                        if (int.TryParse(key, out int k) && int.TryParse(value, out int v))
+                            mapping[k] = v;
+                    }
+                }
+            }
+
+            if (mapping.Count != ChaosValidator.TOTAL)
+            {
+                Plugin.Log.LogWarning($"CHAOS LOAD: Expected {ChaosValidator.TOTAL} entries, got {mapping.Count}");
+                return false;
+            }
+
+            _assignment = new int[ChaosValidator.TOTAL];
+            for (int i = 0; i < ChaosValidator.TOTAL; i++)
+                _assignment[i] = mapping.TryGetValue(i, out int v) ? v : i;
+
+            BuildReverseMap();
+            Plugin.Log.LogInfo($"CHAOS LOAD: Loaded mapping with {ChaosValidator.TOTAL} entries.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"Failed to load chaos mapping: {ex.Message}");
+            return false;
+        }
+    }
+}
+
+// =====================================================================
+// AP Notification UI — Shows item sent/received messages in-game
+// =====================================================================
+public class APNotificationUI : MonoBehaviour
+{
+    public APNotificationUI(IntPtr ptr) : base(ptr) { }
+
+    private static APNotificationUI _instance;
+    private static GameObject _canvasGO;
+
+    private readonly struct Notification
+    {
+        public readonly string Text;
+        public readonly float ExpireTime;
+        public Notification(string text, float expireTime) { Text = text; ExpireTime = expireTime; }
+    }
+
+    private static readonly Queue<Notification> _pendingQueue = new();
+    private static readonly List<Notification> _activeMessages = new();
+    private const int MAX_VISIBLE = 5;
+    private const float DISPLAY_TIME = 5f;
+    private const float FADE_TIME = 0.5f;
+
+    private GameObject _panelGO;
+    private TextMeshProUGUI _textComponent;
+    private CanvasGroup _canvasGroup;
+
+    public static void EnsureCreated()
+    {
+        if (_instance != null) return;
+        _canvasGO = new GameObject("AP_NotificationCanvas");
+        UnityEngine.Object.DontDestroyOnLoad(_canvasGO);
+
+        var canvas = _canvasGO.AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        canvas.sortingOrder = 9999;
+
+        _canvasGO.AddComponent<CanvasScaler>();
+        _canvasGO.AddComponent<GraphicRaycaster>();
+
+        _instance = _canvasGO.AddComponent<APNotificationUI>();
+    }
+
+    void Awake()
+    {
+        // Create panel background
+        _panelGO = new GameObject("AP_NotifPanel");
+        _panelGO.transform.SetParent(_canvasGO.transform, false);
+
+        _canvasGroup = _panelGO.AddComponent<CanvasGroup>();
+        _canvasGroup.alpha = 0f;
+        _canvasGroup.blocksRaycasts = false;
+
+        var bg = _panelGO.AddComponent<Image>();
+        bg.color = new UnityEngine.Color(0f, 0f, 0f, 0.6f);
+
+        var rect = _panelGO.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(0, 1);
+        rect.anchorMax = new Vector2(0, 1);
+        rect.pivot = new Vector2(0, 1);
+        rect.anchoredPosition = new Vector2(10, -10);
+        rect.sizeDelta = new Vector2(600, 50);
+
+        // Create text
+        var textGO = new GameObject("AP_NotifText");
+        textGO.transform.SetParent(_panelGO.transform, false);
+
+        _textComponent = textGO.AddComponent<TextMeshProUGUI>();
+        _textComponent.fontSize = 24;
+        _textComponent.color = UnityEngine.Color.white;
+        _textComponent.alignment = TextAlignmentOptions.TopLeft;
+        _textComponent.raycastTarget = false;
+        _textComponent.enableWordWrapping = true;
+
+        var textRect = textGO.GetComponent<RectTransform>();
+        textRect.anchorMin = Vector2.zero;
+        textRect.anchorMax = Vector2.one;
+        textRect.offsetMin = new Vector2(8, 4);
+        textRect.offsetMax = new Vector2(-8, -4);
+    }
+
+    void Update()
+    {
+        // Move pending messages into active list
+        while (_pendingQueue.Count > 0 && _activeMessages.Count < MAX_VISIBLE)
+        {
+            var pending = _pendingQueue.Dequeue();
+            _activeMessages.Add(new Notification(pending.Text, Time.time + DISPLAY_TIME));
+        }
+
+        // Remove expired messages
+        _activeMessages.RemoveAll(n => Time.time > n.ExpireTime);
+
+        // Update display
+        if (_activeMessages.Count > 0)
+        {
+            _textComponent.text = string.Join("\n", _activeMessages.ConvertAll(n => n.Text));
+
+            // Resize panel to fit content
+            var rect = _panelGO.GetComponent<RectTransform>();
+            float textHeight = _textComponent.preferredHeight + 12;
+            rect.sizeDelta = new Vector2(600, Mathf.Max(50, textHeight));
+
+            // Fade in
+            _canvasGroup.alpha = Mathf.Min(_canvasGroup.alpha + Time.deltaTime / FADE_TIME, 0.95f);
+        }
+        else
+        {
+            // Fade out
+            _canvasGroup.alpha = Mathf.Max(_canvasGroup.alpha - Time.deltaTime / FADE_TIME, 0f);
+        }
+    }
+
+    public static void Show(string message)
+    {
+        lock (_pendingQueue)
+        {
+            _pendingQueue.Enqueue(new Notification(message, 0));
+        }
+    }
+}
+
+// =====================================================================
+// AP Update Runner — MonoBehaviour that ticks ProcessPendingItems
+// Registered as IL2CPP type, lives on a DontDestroyOnLoad GameObject.
+// =====================================================================
+public class APUpdateRunner : MonoBehaviour
+{
+    public APUpdateRunner(IntPtr ptr) : base(ptr) { }
+
+    private static GameObject _runnerGO;
+    private static bool _spawned = false;
+
+    public static void EnsureRunning()
+    {
+        if (_spawned) return;
+        _spawned = true;
+        _runnerGO = new GameObject("AP_UpdateRunner");
+        UnityEngine.Object.DontDestroyOnLoad(_runnerGO);
+        _runnerGO.AddComponent<APUpdateRunner>();
+        APNotificationUI.EnsureCreated();
+        Plugin.Log.LogInfo("AP: Update runner started.");
+    }
+
+    private float _reconcileTimer = 0f;
+    private const float RECONCILE_INTERVAL = 1.0f; // Check every second
+
+    void Update()
+    {
+        if (Plugin.APClient == null) return;
+
+        if (Plugin.APClient.IsConnected)
+            Plugin.APClient.ProcessPendingItems();
+
+        // Periodically reconcile physical state (doors, cards, ingredients)
+        // This catches items received before the scene loaded
+        _reconcileTimer += Time.deltaTime;
+        if (_reconcileTimer >= RECONCILE_INTERVAL)
+        {
+            _reconcileTimer = 0f;
+            Plugin.APClient.ReconcilePhysicalState();
+        }
+    }
+}
+
+// =====================================================================
+// Archipelago Client — Connects to AP server for multiworld
+// =====================================================================
+public class ArchipelagoClient
+{
+    public const long BASE_ID = 39_100_000;
+
+    private ArchipelagoSession _session;
+    private bool _connected = false;
+    private readonly Queue<(long itemId, string itemName, string senderName)> _receivedItemQueue = new();
+    private readonly HashSet<long> _checkedLocations = new();
+    // Dedup tracking: callbacks and SyncFromServer both deliver items from the
+    // same ordered stream. _totalCallbackItemsSeen counts how many callback items
+    // we've dequeued total; _syncedItemCount is the count of items SyncFromServer
+    // last processed. If callback index <= synced count, that item was already
+    // handled by sync, so skip it.
+    private int _totalCallbackItemsSeen = 0;
+    private int _syncedItemCount = 0;
+
+    // Granted items tracking
+    private readonly HashSet<int> _unlockedDoors = new();
+    private readonly HashSet<int> _collectedCardIndices = new();
+    private readonly HashSet<int> _collectedIngredientTypes = new();
+    private int _crestCount = 0;
+    private bool _hasLeftCrest = false;
+    private bool _hasRightCrest = false;
+
+    // Recipesanity
+    public bool RecipesanityEnabled = false;
+    private readonly HashSet<int> _cookedRecipes = new();
+
+    // Physical state tracking — what we've actually applied in-scene
+    private readonly HashSet<int> _physicallyUnlockedDoors = new();
+    private readonly HashSet<int> _physicallyGrantedCards = new();
+    private readonly HashSet<int> _physicallyGrantedIngredients = new();
+
+    // Ingredient slot counter for sending checks
+    private readonly Dictionary<int, int> _ingCheckCounter = new();
+
+    // Persistence
+    private string _savePath;
+    private string _roomSeed = "";
+
+    public bool IsConnected => _connected;
+    public bool HasDoor(int doorId) => _unlockedDoors.Contains(doorId);
+    public bool HasCard(int recipeIdx) => _collectedCardIndices.Contains(recipeIdx);
+    public bool HasIngredientType(int typeId) => _collectedIngredientTypes.Contains(typeId) || _discoveredPinnedTypes.Contains(typeId);
+    public int CrestCount => _crestCount;
+
+    // Pinned ingredient types discovered via physical pickup (not AP items)
+    private readonly HashSet<int> _discoveredPinnedTypes = new();
+    public void RegisterPinnedTypeDiscovered(int typeId) => _discoveredPinnedTypes.Add(typeId);
+
+    public ArchipelagoClient()
+    {
+        _savePath = Path.Combine(BepInEx.Paths.PluginPath, "CK_AP_State.json");
+    }
+
+    // ---------------------------------------------------------------
+    // AP Item ID ↔ Game mapping
+    // ---------------------------------------------------------------
+
+    // Key item AP IDs use door ID as offset: BASE_ID + doorId
+    static readonly Dictionary<long, int> _apIdToDoorId = new()
+    {
+        { BASE_ID + 1,  1 },  // Bedroom
+        { BASE_ID + 2,  2 },  // Bathroom
+        { BASE_ID + 3,  3 },  // Oddities Room
+        { BASE_ID + 6,  6 },  // Freezer
+        { BASE_ID + 8,  8 },  // Cheese Cabinet
+        { BASE_ID + 9,  9 },  // Shed
+        { BASE_ID + 10, 10 }, // Mug Cabinet
+        { BASE_ID + 11, 11 }, // Bowl Cabinet
+        { BASE_ID + 4,  4 },  // Pantry
+        { BASE_ID + 5,  5 },  // Fridge
+    };
+
+    // Crest AP IDs
+    static readonly HashSet<long> _crestApIds = new() { BASE_ID + 100, BASE_ID + 101 };
+
+    // Card AP IDs: BASE_ID + 200..238 → recipe index 0..38
+    static int? ApIdToRecipeIndex(long apId)
+    {
+        long offset = apId - (BASE_ID + 200);
+        if (offset >= 0 && offset < 39) return (int)offset;
+        return null;
+    }
+
+    // Ingredient AP IDs: BASE_ID + 300..325 → slot index 0..25
+    static int? ApIdToIngredientSlotIndex(long apId)
+    {
+        long offset = apId - (BASE_ID + 300);
+        if (offset >= 0 && offset < 26) return (int)offset;
+        return null;
+    }
+
+    // Mushroom AP IDs: BASE_ID + 326..330 → UnlockableItemID types 6, 25, 26, 27, 28
+    static readonly Dictionary<long, int> _mushroomApIdToType = new()
+    {
+        { BASE_ID + 326, 6 },   // Regular Mushroom
+        { BASE_ID + 327, 25 },  // Oyster Mushroom
+        { BASE_ID + 328, 26 },  // Morel Mushroom
+        { BASE_ID + 329, 27 },  // Honey Mushroom
+        { BASE_ID + 330, 28 },  // Amanita Mushroom
+    };
+
+    // Mushroom discovery location IDs
+    static readonly Dictionary<int, long> _mushroomTypeToLocationId = new()
+    {
+        { 6,  BASE_ID + 750 },  // Regular Mushroom
+        { 25, BASE_ID + 751 },  // Oyster Mushroom
+        { 26, BASE_ID + 752 },  // Morel Mushroom
+        { 27, BASE_ID + 753 },  // Honey Mushroom
+        { 28, BASE_ID + 754 },  // Amanita Mushroom
+    };
+
+    public void CheckMushroomDiscovery(int unlockableTypeId)
+    {
+        if (_mushroomTypeToLocationId.TryGetValue(unlockableTypeId, out long locId))
+            SendCheck(locId);
+    }
+
+    /// <summary>
+    /// Resolve which ingredient slot this pickup is (by counting same-type pickups)
+    /// and send the corresponding AP location check.
+    /// </summary>
+    public void CheckIngredientPickup(int origType)
+    {
+        int counter = _ingCheckCounter.GetValueOrDefault(origType, 0);
+        _ingCheckCounter[origType] = counter + 1;
+
+        int seen = 0;
+        for (int i = 0; i < IngredientRandomizer.TOTAL_SLOTS; i++)
+        {
+            if (IngredientRandomizer.Slots[i].OrigType == origType)
+            {
+                if (seen == counter)
+                {
+                    CheckIngredientSpot(i);
+                    return;
+                }
+                seen++;
+            }
+        }
+        Plugin.Log.LogWarning($"AP CHECK: Ingredient overflow for type {origType} (counter={counter})");
+    }
+
+    // ---------------------------------------------------------------
+    // AP Location ID mapping
+    // ---------------------------------------------------------------
+
+    // Reward locations: BASE_ID + 500..511
+    // 500 = Table, 501 = Crow, 502 = Oddities, 503-511 = creatures
+    public static long TableLocationId => BASE_ID + 500;
+    public static long CrowLocationId => BASE_ID + 501;
+    public static long OdditiesLocationId => BASE_ID + 502;
+
+    // Creature reward locations by creature ID
+    static readonly Dictionary<int, long> _creatureToLocationId = new()
+    {
+        { KeyRandomizer.RACCOON,      BASE_ID + 503 },
+        { KeyRandomizer.RAT,          BASE_ID + 504 },
+        { KeyRandomizer.GREY,         BASE_ID + 505 },
+        { KeyRandomizer.SASSFOOT,     BASE_ID + 506 },
+        { KeyRandomizer.TREE_OCTOPUS, BASE_ID + 507 },
+        { KeyRandomizer.GOOBER,       BASE_ID + 508 },
+        { KeyRandomizer.FROG,         BASE_ID + 509 },
+        { KeyRandomizer.JAKE,         BASE_ID + 510 },
+        { KeyRandomizer.MOTH,         BASE_ID + 511 },
+    };
+
+    // Card spot locations: BASE_ID + 600 + recipeIndex
+    public static long CardSpotLocationId(int recipeIdx) => BASE_ID + 600 + recipeIdx;
+
+    // Ingredient spot locations: BASE_ID + 700 + slotIndex
+    public static long IngredientSpotLocationId(int slotIdx) => BASE_ID + 700 + slotIdx;
+
+    public static long CreatureLocationId(int creatureId) =>
+        _creatureToLocationId.TryGetValue(creatureId, out long id) ? id : -1;
+
+    // ---------------------------------------------------------------
+    // Connection
+    // ---------------------------------------------------------------
+
+    public void Connect()
+    {
+        if (_connected) return;
+
+        string server = Plugin.APServer.Value;
+        int port = Plugin.APPort.Value;
+        string slotName = Plugin.APSlotName.Value;
+        string password = Plugin.APPassword.Value;
+
+        try
+        {
+            Plugin.Log.LogInfo($"AP: Connecting to {server}:{port} as '{slotName}'...");
+
+            _session = ArchipelagoSessionFactory.CreateSession(server, port);
+
+            // Register error handler for websocket issues
+            _session.Socket.ErrorReceived += (e, args) =>
+            {
+                Plugin.Log.LogError($"AP SOCKET ERROR: {args}");
+            };
+
+            // Register item received handler
+            _session.Items.ItemReceived += OnItemReceived;
+
+            Plugin.Log.LogInfo("AP: Session created, attempting login...");
+
+            var result = _session.TryConnectAndLogin(
+                "Creature Kitchen",
+                slotName,
+                ItemsHandlingFlags.AllItems,
+                new Version(0, 5, 0),
+                password: string.IsNullOrEmpty(password) ? null : password
+            );
+
+            if (result.Successful)
+            {
+                _connected = true;
+                var loginSuccess = (LoginSuccessful)result;
+                Plugin.Log.LogInfo($"AP: Connected successfully! Slot: {slotName}, Team: {loginSuccess.Team}");
+
+                // Read slot data from AP server (game options set in YAML)
+                ReadSlotData(loginSuccess.SlotData);
+
+                // Get room seed to detect new sessions
+                string roomSeed = "";
+                try { roomSeed = _session.RoomState.Seed ?? ""; }
+                catch { /* older API might not have this */ }
+
+                // Load saved state
+                LoadState();
+
+                // If room seed changed, clear old state
+                if (!string.IsNullOrEmpty(roomSeed) && !string.IsNullOrEmpty(_roomSeed) && roomSeed != _roomSeed)
+                {
+                    Plugin.Log.LogInfo($"AP: New room detected (was: {_roomSeed}, now: {roomSeed}). Clearing old state.");
+                    ClearSavedState();
+                }
+                _roomSeed = roomSeed;
+                SaveState(); // Save the new seed
+
+                // Re-send any checked locations the server might have missed
+                ResendChecks();
+
+                // Sync all received items from the server (AP is the source of truth)
+                SyncFromServer();
+
+                Plugin.Log.LogInfo("AP: Reconciler will apply doors/cards/ingredients when scene loads.");
+            }
+            else
+            {
+                var failure = (LoginFailure)result;
+                string errors = string.Join(", ", failure.Errors);
+                Plugin.Log.LogError($"AP: Login failed: {errors}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"AP: Connection error: {ex.GetType().Name}: {ex.Message}");
+            if (ex.InnerException != null)
+                Plugin.Log.LogError($"AP: Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+        }
+    }
+
+    public void Disconnect()
+    {
+        if (!_connected || _session == null) return;
+        try
+        {
+            _session.Socket.DisconnectAsync();
+            _connected = false;
+            Plugin.Log.LogInfo("AP: Disconnected.");
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"AP: Disconnect error: {ex.Message}"); }
+    }
+
+    // ---------------------------------------------------------------
+    // Slot data — game options from the AP YAML
+    // ---------------------------------------------------------------
+
+    void ReadSlotData(Dictionary<string, object> slotData)
+    {
+        if (slotData == null) return;
+        try
+        {
+            if (slotData.TryGetValue("creature_gate", out object cgVal))
+            {
+                CreaturesRequiredForCrest = Convert.ToInt32(cgVal);
+                Plugin.Log.LogInfo($"AP SLOT DATA: creature_gate = {CreaturesRequiredForCrest}");
+            }
+
+            if (slotData.TryGetValue("recipesanity", out object rsVal))
+            {
+                RecipesanityEnabled = Convert.ToInt32(rsVal) != 0;
+                Plugin.Log.LogInfo($"AP SLOT DATA: recipesanity = {RecipesanityEnabled}");
+            }
+        }
+        catch (Exception ex) { Plugin.Log.LogWarning($"AP SLOT DATA ERROR: {ex.Message}"); }
+    }
+
+    // ---------------------------------------------------------------
+    // Sending location checks
+    // ---------------------------------------------------------------
+
+    public void SendCheck(long locationId)
+    {
+        if (_checkedLocations.Contains(locationId)) return;
+        _checkedLocations.Add(locationId);
+        SaveState();
+
+        if (!_connected || _session == null) return;
+        try
+        {
+            _session.Locations.CompleteLocationChecks(locationId);
+            string locName = _session.Locations.GetLocationNameFromId(locationId) ?? $"Location {locationId}";
+            Plugin.Log.LogInfo($"AP: Sent check for location {locationId}");
+            APNotificationUI.Show($"Sent {locName}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"AP: Failed to send check {locationId}: {ex.Message}");
+        }
+    }
+
+    // Convenience methods for sending checks from patches
+    public void CheckTableLocation() => SendCheck(TableLocationId);
+    public void CheckCrowLocation()
+    {
+        SendCheck(CrowLocationId);
+        // Crow counts as a creature fed — try crest door in case threshold crossed
+        TryCrestDoorAfterCreatureFed();
+    }
+    public void CheckOdditiesLocation() => SendCheck(OdditiesLocationId);
+    public void CheckCreatureLocation(int creatureId)
+    {
+        long locId = CreatureLocationId(creatureId);
+        if (locId > 0) SendCheck(locId);
+        // This creature counts as fed — try crest door in case threshold crossed
+        TryCrestDoorAfterCreatureFed();
+    }
+    public void CheckCardSpot(int recipeIdx) => SendCheck(CardSpotLocationId(recipeIdx));
+    public void CheckIngredientSpot(int slotIdx) => SendCheck(IngredientSpotLocationId(slotIdx));
+
+    // ---------------------------------------------------------------
+    // Recipesanity — track cooked recipes as checks
+    // ---------------------------------------------------------------
+
+    // Cook location IDs: BASE_ID + 800 + cookIndex (0-42)
+    public static long CookLocationId(int cookIdx) => BASE_ID + 800 + cookIdx;
+
+    /// <summary>
+    /// Identify a cooked RecipeData and send the corresponding cook check.
+    /// Cook indices: 0-38 = non-default recipes, 39-41 = defaults, 42 = Mistake.
+    /// </summary>
+    public void CheckRecipeCooked(RecipeData cookedRecipe)
+    {
+        if (!RecipesanityEnabled) return;
+        if (cookedRecipe == null) return;
+
+        int cookIdx = IdentifyCookedRecipe(cookedRecipe);
+        if (cookIdx < 0 || cookIdx > 42) return;
+
+        if (_cookedRecipes.Contains(cookIdx)) return; // Already checked
+        _cookedRecipes.Add(cookIdx);
+
+        SendCheck(CookLocationId(cookIdx));
+        Plugin.Log.LogInfo($"AP COOK CHECK: Recipe index {cookIdx} cooked (location {CookLocationId(cookIdx)})");
+    }
+
+    int IdentifyCookedRecipe(RecipeData recipe)
+    {
+        // Try matching via RecipeCardData → card title → RecipeLogic index
+        try
+        {
+            var allCards = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+            if (allCards != null)
+            {
+                foreach (var card in allCards)
+                {
+                    if (card.GetRecipeDataFromCard() == recipe)
+                    {
+                        string title = card.GetRecipeTitle();
+                        for (int i = 0; i < RecipeLogic.Recipes.Length; i++)
+                            if (RecipeLogic.Recipes[i].Name == title) return i;
+                        for (int i = 0; i < RecipeLogic.DefaultRecipes.Length; i++)
+                            if (RecipeLogic.DefaultRecipes[i].name == title) return 39 + i;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        // No card match — try FoodData name (for defaults without cards)
+        try
+        {
+            var foodData = recipe.GetFoodData();
+            if (foodData != null)
+            {
+                string name = foodData.name;
+                Plugin.Log.LogInfo($"AP COOK ID: FoodData.name = '{name}' (no card match)");
+                if (name.Contains("Toast")) return 39;
+                if (name.Contains("Pancake")) return 40;
+                if (name.Contains("Fries") || name.Contains("FrenchFire")) return 41;
+            }
+        }
+        catch { }
+
+        // Fallback: Mistake
+        return 42;
+    }
+
+    // ---------------------------------------------------------------
+    // Creature-fed gating for crest door
+    // ---------------------------------------------------------------
+    public int CreaturesRequiredForCrest = 3; // Default, overridden by slot data
+
+    /// <summary>
+    /// Count how many creature reward locations have been checked (Crow + 9 creatures).
+    /// Uses _checkedLocations which is already persisted to CK_AP_State.json.
+    /// </summary>
+    public int CountCreaturesFed()
+    {
+        int count = 0;
+        if (_checkedLocations.Contains(CrowLocationId)) count++;
+        foreach (var kvp in _creatureToLocationId)
+        {
+            if (_checkedLocations.Contains(kvp.Value)) count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Check if all requirements for the crest door are met:
+    /// both crests + enough creatures fed + Fortunate Gems Card + Fridge Key + Bowl Cabinet Key.
+    /// </summary>
+    public bool CrestDoorRequirementsMet()
+    {
+        if (_crestCount < 2) return false;
+        if (CountCreaturesFed() < CreaturesRequiredForCrest) return false;
+        if (!_collectedCardIndices.Contains(38)) return false; // Fortunate Gems Card
+        if (!_unlockedDoors.Contains(5)) return false;         // Fridge Key
+        if (!_unlockedDoors.Contains(11)) return false;        // Bowl Cabinet Key
+        return true;
+    }
+
+    void TryCrestDoorAfterCreatureFed()
+    {
+        if (_crestDoorUnlocked) return;
+        if (CrestDoorRequirementsMet())
+        {
+            Plugin.Log.LogInfo($"AP CREST GATE: All requirements met (creatures={CountCreaturesFed()}/{CreaturesRequiredForCrest}), attempting crest door unlock");
+            UnlockCrestDoor();
+        }
+    }
+
+    /// <summary>
+    /// Called from the CrestDoor interact patch — player is at the door
+    /// and all conditions are met, so unlock immediately.
+    /// </summary>
+    public void ForceUnlockCrestDoor()
+    {
+        UnlockCrestDoor();
+    }
+
+    // ---------------------------------------------------------------
+    // Receiving items (called from background thread!)
+    // ---------------------------------------------------------------
+
+    private void OnItemReceived(Archipelago.MultiClient.Net.Helpers.ReceivedItemsHelper helper)
+    {
+        // Drain ALL pending items — AP may batch multiple items in one callback
+        for (; ; )
+        {
+            var item = helper.DequeueItem();
+            if (item == null) break;
+
+            string itemName = _session.Items.GetItemName(item.ItemId) ?? $"Item#{item.ItemId}";
+            string senderName = _session.Players.GetPlayerName(item.Player) ?? $"Player#{item.Player}";
+
+            lock (_receivedItemQueue)
+            {
+                _receivedItemQueue.Enqueue((item.ItemId, itemName, senderName));
+            }
+
+            Plugin.Log.LogInfo($"AP: Received '{itemName}' from {senderName} (id={item.ItemId})");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Process received items (call from Unity main thread!)
+    // ---------------------------------------------------------------
+
+    public void ProcessPendingItems()
+    {
+        if (!_connected) return;
+
+        List<(long itemId, string itemName, string senderName)> toProcess = new();
+        lock (_receivedItemQueue)
+        {
+            while (_receivedItemQueue.Count > 0)
+                toProcess.Add(_receivedItemQueue.Dequeue());
+        }
+
+        foreach (var (itemId, itemName, senderName) in toProcess)
+        {
+            _totalCallbackItemsSeen++;
+
+            // If SyncFromServer already processed this item (by index in the
+            // ordered item stream), skip the duplicate grant.
+            if (_totalCallbackItemsSeen <= _syncedItemCount)
+                continue;
+
+            GrantItem(itemId, itemName);
+            APNotificationUI.Show($"Received {itemName} from {senderName}");
+        }
+    }
+
+    void GrantItem(long itemId, string itemName, bool logAndSave = true)
+    {
+        try
+        {
+            // Key?
+            if (_apIdToDoorId.TryGetValue(itemId, out int doorId))
+            {
+                _unlockedDoors.Add(doorId);
+                UnlockDoorInGame(doorId, playCutscene: logAndSave);
+                Plugin.Log.LogInfo($"AP GRANT: Unlocked door {doorId} ({itemName})");
+                TryCrestDoorAfterCreatureFed(); // Fridge/Bowl keys are gate requirements
+                return;
+            }
+
+            // Crest?
+            if (_crestApIds.Contains(itemId))
+            {
+                _crestCount++;
+                if (itemId == BASE_ID + 100) _hasLeftCrest = true;   // Crest Half (Left)
+                if (itemId == BASE_ID + 101) _hasRightCrest = true;  // Crest Half (Right)
+                Plugin.Log.LogInfo($"AP GRANT: Crest #{_crestCount} ({itemName}) [L={_hasLeftCrest} R={_hasRightCrest}]");
+                UnlockCrestDoor();
+                return;
+            }
+
+            // Card?
+            int? recipeIdx = ApIdToRecipeIndex(itemId);
+            if (recipeIdx.HasValue)
+            {
+                _collectedCardIndices.Add(recipeIdx.Value);
+                GrantRecipeCard(recipeIdx.Value);
+                Plugin.Log.LogInfo($"AP GRANT: Collected card #{recipeIdx.Value} ({itemName})");
+                TryCrestDoorAfterCreatureFed(); // Fortunate Gems Card is a gate requirement
+                return;
+            }
+
+            // Ingredient?
+            int? ingSlot = ApIdToIngredientSlotIndex(itemId);
+            if (ingSlot.HasValue)
+            {
+                int typeId = IngredientRandomizer.Slots[ingSlot.Value].OrigType;
+                _collectedIngredientTypes.Add(typeId);
+                GrantIngredientUnlock(typeId);
+                Plugin.Log.LogInfo($"AP GRANT: Collected ingredient type {typeId} ({itemName})");
+                return;
+            }
+
+            // Mushroom?
+            if (_mushroomApIdToType.TryGetValue(itemId, out int mushType))
+            {
+                _collectedIngredientTypes.Add(mushType);
+                GrantIngredientUnlock(mushType);
+                Plugin.Log.LogInfo($"AP GRANT: Collected mushroom type {mushType} ({itemName})");
+                return;
+            }
+
+            // Filler item (Slop from recipesanity)?
+            if (IsFillerItem(itemId))
+            {
+                Plugin.Log.LogInfo($"AP GRANT: Filler '{itemName}' (no in-game effect)");
+                return;
+            }
+
+            Plugin.Log.LogWarning($"AP GRANT: Unknown item {itemId} ({itemName})");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"AP GRANT ERROR: {ex.Message}");
+        }
+    }
+
+    // Check if it's a filler item (Slop from recipesanity)
+    static bool IsFillerItem(long itemId)
+    {
+        long offset = itemId - (BASE_ID + 400);
+        return offset >= 0 && offset < 43;
+    }
+
+    // ---------------------------------------------------------------
+    // In-game effects
+    // ---------------------------------------------------------------
+
+    void UnlockDoorInGame(int doorId, bool playCutscene = false)
+    {
+        try
+        {
+            // Write to save data so Door.CheckDoorUnlockedFromSave picks it up
+            try
+            {
+                var settings = UnityEngine.Object.FindObjectOfType<GlobalPlayerSettings>();
+                if (settings != null && settings.m_SaveData != null)
+                {
+                    // Determine the character values the game uses
+                    char usedChar = SharedData.m_KeyStatusUsed;
+                    char unobtainedChar = SharedData.m_KeyStatusUnobtained;
+
+                    // Fallback if not initialized (common values)
+                    if (usedChar == '\0') usedChar = '2';
+                    if (unobtainedChar == '\0') unobtainedChar = '0';
+
+                    string current = settings.m_SaveData.m_KeysUsed ?? "";
+
+                    while (current.Length <= doorId)
+                        current += unobtainedChar;
+
+                    if (current[doorId] != usedChar)
+                    {
+                        char[] chars = current.ToCharArray();
+                        chars[doorId] = usedChar;
+                        settings.m_SaveData.m_KeysUsed = new string(chars);
+                        Plugin.Log.LogInfo($"AP DOOR SAVE: Set bit {doorId} to '{usedChar}' (now: '{settings.m_SaveData.m_KeysUsed}')");
+                    }
+                }
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning($"AP DOOR SAVE ERROR: {ex.Message}"); }
+
+            // Unlock the physical door if it exists in the scene
+            bool found = false;
+            Door unlockedDoor = null;
+            foreach (var door in UnityEngine.Object.FindObjectsOfType<Door>())
+            {
+                if ((int)door.GetLockID() == doorId)
+                {
+                    // Door is still locked with our target ID — unlock it
+                    door.UnlockDoor();
+                    unlockedDoor = door;
+                    found = true;
+                    Plugin.Log.LogInfo($"AP DOOR: Unlocked Door with LockID {doorId} ('{door.gameObject.name}')");
+                }
+                else if ((int)door.m_StartingLockID == doorId)
+                {
+                    // Door's starting ID matches but current LockID doesn't —
+                    // game already unlocked it via CheckDoorUnlockedFromSave on load
+                    found = true;
+                }
+            }
+            if (found)
+            {
+                _physicallyUnlockedDoors.Add(doorId);
+
+                if (playCutscene && unlockedDoor != null)
+                {
+                    try
+                    {
+                        var cutscene = UnityEngine.Object.FindObjectOfType<DoorUnlockCutscene>();
+                        if (cutscene != null)
+                        {
+                            cutscene.OnDoorUnlock(unlockedDoor);
+                            Plugin.Log.LogInfo($"AP DOOR: Triggered unlock cutscene for door {doorId}");
+                        }
+                    }
+                    catch (Exception ex) { Plugin.Log.LogWarning($"AP DOOR CUTSCENE: {ex.Message}"); }
+                }
+            }
+            // else: Door not in scene yet — reconciler will retry
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"AP DOOR ERROR: {ex.Message}");
+        }
+    }
+
+    // Flag to prevent re-sending AP checks when granting items from AP
+    public bool GrantingFromAP = false;
+
+    void GrantRecipeCard(int recipeIdx)
+    {
+        try
+        {
+            if (recipeIdx < 0 || recipeIdx >= RecipeLogic.Recipes.Length) return;
+
+            string recipeName = RecipeLogic.Recipes[recipeIdx].Name;
+
+            // Find a RecipeCard in the active scene whose data matches
+            foreach (var card in UnityEngine.Object.FindObjectsOfType<RecipeCard>())
+            {
+                if (card.m_RecipeCardUnlocked != null && card.m_RecipeCardUnlocked.GetRecipeTitle() == recipeName)
+                {
+                    // Use bypass flag so our Prefix doesn't send another check
+                    GrantingFromAP = true;
+                    try { card.ObtainCard(); }
+                    catch { /* VFX/audio NullRef is non-fatal */ }
+                    GrantingFromAP = false;
+
+                    _physicallyGrantedCards.Add(recipeIdx);
+                    Plugin.Log.LogInfo($"AP CARD: Granted '{recipeName}' via ObtainCard (bypass)");
+                    return;
+                }
+            }
+
+            // Card not in scene — try granting via RecipeCardData + event directly
+            // (handles resumed games where physical cards are already collected)
+            var allCardData = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+            if (allCardData != null)
+            {
+                foreach (var cardData in allCardData)
+                {
+                    if (cardData.GetRecipeTitle() == recipeName)
+                    {
+                        try { RecipeCard.RecipeCardFoundEvent?.Invoke(cardData); }
+                        catch { /* event handler error is non-fatal */ }
+                        _physicallyGrantedCards.Add(recipeIdx);
+                        Plugin.Log.LogInfo($"AP CARD: Granted '{recipeName}' via RecipeCardFoundEvent (no physical card)");
+                        return;
+                    }
+                }
+            }
+
+            // Neither physical card nor card data found — scene not loaded yet
+            Plugin.Log.LogInfo($"AP CARD: '{recipeName}' not in scene yet, will retry");
+        }
+        catch (Exception ex)
+        {
+            GrantingFromAP = false;
+            Plugin.Log.LogError($"AP CARD ERROR: {ex.Message}");
+        }
+    }
+
+    void GrantIngredientUnlock(int typeId)
+    {
+        try
+        {
+            // Write to save data first (mirrors the door pattern) so ingredient
+            // is persisted even if we can't find a physical ItemUnlockable right now
+            WriteIngredientSaveData(typeId);
+
+            // Try to find a usable ItemUnlockable to trigger the physical unlock
+            // (spawns the ingredient in pantry, fires events, etc.)
+            ItemUnlockable bestUnlockable = null;
+
+            foreach (var unlockable in Resources.FindObjectsOfTypeAll<ItemUnlockable>())
+            {
+                if ((int)unlockable.GetUnlockItemID() == typeId)
+                {
+                    // Already unlocked in-game → no need to trigger again
+                    if (unlockable.IsUnlocked())
+                    {
+                        _physicallyGrantedIngredients.Add(typeId);
+                        Plugin.Log.LogInfo($"AP INGREDIENT: Type {typeId} already unlocked in-game");
+                        return;
+                    }
+
+                    // Prefer one with a valid m_Item (can trigger OnItemPickedUp)
+                    if (unlockable.m_Item != null)
+                    {
+                        bestUnlockable = unlockable;
+                        break; // Found a usable one, no need to keep searching
+                    }
+                }
+            }
+
+            if (bestUnlockable != null)
+            {
+                GrantingFromAP = true;
+                bestUnlockable.OnItemPickedUp(bestUnlockable.m_Item);
+                GrantingFromAP = false;
+
+                _physicallyGrantedIngredients.Add(typeId);
+                Plugin.Log.LogInfo($"AP INGREDIENT: Unlocked type {typeId} via OnItemPickedUp (bypass)");
+            }
+            else
+            {
+                // No usable ItemUnlockable right now — save data is written,
+                // reconciler will retry physical unlock when scene reloads
+                Plugin.Log.LogInfo($"AP INGREDIENT: Type {typeId} save data written, no physical unlock yet (reconciler will retry)");
+            }
+        }
+        catch (Exception ex)
+        {
+            GrantingFromAP = false;
+            Plugin.Log.LogError($"AP INGREDIENT ERROR: {ex.Message}");
+        }
+    }
+
+    void WriteIngredientSaveData(int typeId)
+    {
+        try
+        {
+            var settings = UnityEngine.Object.FindObjectOfType<GlobalPlayerSettings>();
+            if (settings == null || settings.m_SaveData == null) return;
+
+            string current = settings.m_SaveData.m_IngredientsUnlocked ?? "";
+
+            // m_IngredientsUnlocked uses the same char pattern as m_KeysUsed:
+            // position = UnlockableItemID, char = status
+            // '1' marks as unlocked (matching m_KeyStatusObtained)
+            char unlockedChar = '1';
+            char defaultChar = '0';
+
+            while (current.Length <= typeId)
+                current += defaultChar;
+
+            if (current[typeId] != unlockedChar)
+            {
+                char[] chars = current.ToCharArray();
+                chars[typeId] = unlockedChar;
+                settings.m_SaveData.m_IngredientsUnlocked = new string(chars);
+                Plugin.Log.LogInfo($"AP ING SAVE: Set bit {typeId} to '{unlockedChar}' (now: '{settings.m_SaveData.m_IngredientsUnlocked}')");
+            }
+        }
+        catch (Exception ex) { Plugin.Log.LogWarning($"AP ING SAVE ERROR: {ex.Message}"); }
+    }
+
+    private bool _crestDoorUnlocked = false;
+    private bool _crestVisualsPlaced = false;
+
+    void UnlockCrestDoor()
+    {
+        if (_crestDoorUnlocked) return;
+
+        try
+        {
+            // Find CrestDoor objects and place crest visuals for received sides only
+            var crestDoors = UnityEngine.Object.FindObjectsOfType<CrestDoor>();
+            if (crestDoors == null || crestDoors.Length == 0) return; // Scene not loaded, reconciler will retry
+
+            bool leftPlaced = false, rightPlaced = false;
+            foreach (var crestDoor in crestDoors)
+            {
+                int side = (int)crestDoor.m_DoorSide; // 0 = LEFT, 1 = RIGHT
+
+                // Only show the crest visual if we've received that side
+                bool shouldPlace = (side == 0 && _hasLeftCrest) || (side == 1 && _hasRightCrest);
+                if (shouldPlace && crestDoor.m_CrestDisplay != null)
+                {
+                    crestDoor.m_CrestDisplay.SetActive(true);
+                    Plugin.Log.LogInfo($"AP CREST: Placed crest on door side {side}");
+                }
+
+                if (side == 0 && _hasLeftCrest) leftPlaced = true;
+                if (side == 1 && _hasRightCrest) rightPlaced = true;
+            }
+
+            _crestVisualsPlaced = true;
+
+            // Gate: all requirements must be met before door opens
+            bool allRequirementsMet = CrestDoorRequirementsMet();
+
+            if (allRequirementsMet && leftPlaced && rightPlaced)
+            {
+                // Only now write save data — prevents game's own CheckForDoorStartState
+                // from opening the door prematurely on resume
+                var settings = UnityEngine.Object.FindObjectOfType<GlobalPlayerSettings>();
+                if (settings != null && settings.m_SaveData != null)
+                    settings.m_SaveData.m_iCrestDoorLockState = _crestCount;
+                SharedData.m_iCrestDoorUnlocked = _crestCount;
+                foreach (var crestDoor in crestDoors)
+                {
+                    if (crestDoor.m_DoorOpener != null)
+                    {
+                        try { crestDoor.m_DoorOpener.StartRotation(true); }
+                        catch { try { crestDoor.m_DoorOpener.SnapToGoalAngles(); } catch { } }
+                    }
+                }
+                _crestDoorUnlocked = true;
+                Plugin.Log.LogInfo("AP CREST: Both crests placed + creature gate met — door opening!");
+
+                // Summon Pants now that the crest door is open
+                SummonPantsForAP();
+            }
+            else
+            {
+                string reason = _crestCount < 2 ? $"Crest {_crestCount}/2"
+                    : CountCreaturesFed() < CreaturesRequiredForCrest ? $"Creatures fed {CountCreaturesFed()}/{CreaturesRequiredForCrest}"
+                    : !_collectedCardIndices.Contains(38) ? "Missing Fortunate Gems Card"
+                    : !_unlockedDoors.Contains(5) ? "Missing Fridge Key"
+                    : !_unlockedDoors.Contains(11) ? "Missing Bowl Cabinet Key"
+                    : "Waiting for scene objects";
+                Plugin.Log.LogInfo($"AP CREST: {reason} — door stays closed");
+            }
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"AP CREST ERROR: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Force Pants (Nightcrawler) to appear. Called when the crest door opens
+    /// in AP mode. Also writes save data so Pants reappears on resume.
+    /// </summary>
+    void SummonPantsForAP()
+    {
+        try
+        {
+            // Write save data so the game's own ShouldSummonPantsFromSave() works on reload
+            var settings = UnityEngine.Object.FindObjectOfType<GlobalPlayerSettings>();
+            if (settings != null && settings.m_SaveData != null)
+            {
+                // Set creature count high enough that the game thinks Pants should appear
+                if (settings.m_SaveData.m_iCreaturesForPantsVisit < CreaturesRequiredForCrest)
+                    settings.m_SaveData.m_iCreaturesForPantsVisit = CreaturesRequiredForCrest;
+
+                Plugin.Log.LogInfo($"AP PANTS: Save data set (m_iCreaturesForPantsVisit={settings.m_SaveData.m_iCreaturesForPantsVisit}, m_iPantsVisitCount={settings.m_SaveData.m_iPantsVisitCount})");
+            }
+
+            // Find the NightcrawlerSequencer and call SummonPants directly
+            var sequencer = UnityEngine.Object.FindObjectOfType<NightcrawlerSequencer>();
+            if (sequencer == null)
+            {
+                Plugin.Log.LogInfo("AP PANTS: NightcrawlerSequencer not in scene yet (reconciler will retry)");
+                return;
+            }
+
+            // Skip if Pants was already summoned this session
+            if (sequencer.m_bHasSummoendPants)
+            {
+                Plugin.Log.LogInfo("AP PANTS: Already summoned this session");
+                return;
+            }
+
+            sequencer.SummonPants(2f, true);
+            Plugin.Log.LogInfo("AP PANTS: Summoned Pants via SummonPants(2f, ignoreAlreadySitting=true)");
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"AP PANTS ERROR: {ex.Message}"); }
+    }
+
+    // ---------------------------------------------------------------
+    // Reconciliation — apply pending physical effects after scene load
+    // ---------------------------------------------------------------
+
+    private bool _syncedFromServer = false;
+
+    public void ReconcilePhysicalState()
+    {
+        if (!Plugin.EnableArchipelago.Value) return;
+        if (!_connected || _session == null) return;
+
+        // If we haven't successfully synced any items, try again
+        // (AllItemsReceived may have been empty at Connect time)
+        if (!_syncedFromServer)
+        {
+            SyncFromServer();
+        }
+
+        // Skip if everything is already reconciled
+        bool crestDoorReady = CrestDoorRequirementsMet();
+        bool crestVisualsNeeded = _crestCount > 0 && !_crestVisualsPlaced;
+        if (_physicallyUnlockedDoors.Count >= _unlockedDoors.Count
+            && _physicallyGrantedCards.Count >= _collectedCardIndices.Count
+            && _physicallyGrantedIngredients.Count >= _collectedIngredientTypes.Count
+            && (!crestDoorReady || _crestDoorUnlocked)
+            && !crestVisualsNeeded)
+            return;
+
+        bool anyApplied = false;
+
+        // Doors
+        foreach (int doorId in _unlockedDoors)
+        {
+            if (_physicallyUnlockedDoors.Contains(doorId)) continue;
+            UnlockDoorInGame(doorId);
+            if (_physicallyUnlockedDoors.Contains(doorId)) anyApplied = true;
+        }
+
+        // Cards
+        foreach (int recipeIdx in _collectedCardIndices)
+        {
+            if (_physicallyGrantedCards.Contains(recipeIdx)) continue;
+            GrantRecipeCard(recipeIdx);
+            if (_physicallyGrantedCards.Contains(recipeIdx)) anyApplied = true;
+        }
+
+        // Ingredients
+        foreach (int typeId in _collectedIngredientTypes)
+        {
+            if (_physicallyGrantedIngredients.Contains(typeId)) continue;
+            GrantIngredientUnlock(typeId);
+            if (_physicallyGrantedIngredients.Contains(typeId)) anyApplied = true;
+        }
+
+        // Crest visuals (place as soon as crests received, even before creature gate)
+        if (_crestCount > 0 && !_crestVisualsPlaced)
+        {
+            UnlockCrestDoor();
+            anyApplied = true;
+        }
+
+        // Crest door opening (requires both crests + enough creatures fed)
+        if (crestDoorReady && !_crestDoorUnlocked)
+        {
+            UnlockCrestDoor();
+            if (_crestDoorUnlocked) anyApplied = true;
+        }
+
+        if (anyApplied)
+            Plugin.Log.LogInfo($"AP RECONCILE: Applied pending grants. Doors={_physicallyUnlockedDoors.Count}/{_unlockedDoors.Count}, Cards={_physicallyGrantedCards.Count}/{_collectedCardIndices.Count}, Ings={_physicallyGrantedIngredients.Count}/{_collectedIngredientTypes.Count}, CrestDoor={_crestDoorUnlocked}, CreaturesFed={CountCreaturesFed()}/{CreaturesRequiredForCrest}");
+    }
+
+    // ---------------------------------------------------------------
+    // Goal completion — triggered by credits hook
+    // ---------------------------------------------------------------
+
+    private bool _goalSent = false;
+
+    public void OnGameComplete()
+    {
+        if (_goalSent) return;
+        _goalSent = true;
+        Plugin.Log.LogInfo("AP: *** GOAL COMPLETE — Credits triggered! ***");
+        SendGoalComplete();
+    }
+
+    public void SendGoalComplete()
+    {
+        if (!_connected || _session == null) return;
+        try
+        {
+            var packet = new StatusUpdatePacket { Status = ArchipelagoClientState.ClientGoal };
+            _session.Socket.SendPacket(packet);
+            Plugin.Log.LogInfo("AP: Goal complete sent!");
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"AP: Goal complete error: {ex.Message}"); }
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence — Save/Load state to survive crashes
+    // ---------------------------------------------------------------
+
+    public void SaveState()
+    {
+        try
+        {
+            var lines = new List<string> { "{" };
+
+            // Room seed
+            lines.Add($"  \"seed\": \"{_roomSeed}\",");
+
+            // Checked locations
+            lines.Add("  \"checked\": [");
+            var checkedList = _checkedLocations.OrderBy(x => x).ToList();
+            for (int i = 0; i < checkedList.Count; i++)
+                lines.Add($"    {checkedList[i]}{(i < checkedList.Count - 1 ? "," : "")}");
+            lines.Add("  ]");
+
+            lines.Add("}");
+            File.WriteAllLines(_savePath, lines);
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"AP SAVE ERROR: {ex.Message}"); }
+    }
+
+    public bool LoadState()
+    {
+        try
+        {
+            if (!File.Exists(_savePath)) return false;
+            string json = File.ReadAllText(_savePath);
+
+            // Parse seed
+            var seedMatch = System.Text.RegularExpressions.Regex.Match(json, @"""seed"":\s*""([^""]*)""");
+            if (seedMatch.Success)
+                _roomSeed = seedMatch.Groups[1].Value;
+
+            // Parse checked locations
+            var checkedMatch = System.Text.RegularExpressions.Regex.Match(json, @"""checked"":\s*\[([\s\S]*?)\]");
+            if (checkedMatch.Success)
+            {
+                foreach (var num in System.Text.RegularExpressions.Regex.Matches(checkedMatch.Groups[1].Value, @"\d+"))
+                {
+                    if (long.TryParse(num.ToString(), out long locId))
+                        _checkedLocations.Add(locId);
+                }
+            }
+
+            Plugin.Log.LogInfo($"AP LOAD: Restored {_checkedLocations.Count} checks, seed='{_roomSeed}'");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"AP LOAD ERROR: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Sync all received items from the AP server. AP is the source of truth —
+    /// no need to track received items locally. Call on connect and on game start.
+    /// </summary>
+    public void SyncFromServer()
+    {
+        if (!_connected || _session == null) return;
+
+        try
+        {
+            var allItems = _session.Items.AllItemsReceived;
+            if (allItems == null || allItems.Count == 0)
+            {
+                Plugin.Log.LogInfo("AP SYNC: No items received from server yet.");
+                return;
+            }
+
+            // Clear all tracked state before re-granting
+            _unlockedDoors.Clear();
+            _collectedCardIndices.Clear();
+            _collectedIngredientTypes.Clear();
+            _physicallyUnlockedDoors.Clear();
+            _physicallyGrantedCards.Clear();
+            _physicallyGrantedIngredients.Clear();
+            _crestCount = 0;
+            _hasLeftCrest = false;
+            _hasRightCrest = false;
+            _crestDoorUnlocked = false;
+            _crestVisualsPlaced = false;
+
+            Plugin.Log.LogInfo($"AP SYNC: Applying {allItems.Count} items from server...");
+
+            foreach (var item in allItems)
+            {
+                GrantItem(item.ItemId, _session.Items.GetItemName(item.ItemId) ?? $"Item#{item.ItemId}", logAndSave: false);
+            }
+
+            // Set synced count so ProcessPendingItems skips callback duplicates
+            _syncedItemCount = allItems.Count;
+            _syncedFromServer = true;
+
+            Plugin.Log.LogInfo($"AP SYNC: Done. Doors={_unlockedDoors.Count}, Cards={_collectedCardIndices.Count}, Ingredients={_collectedIngredientTypes.Count}, Crests={_crestCount}, CreaturesFed={CountCreaturesFed()}/{CreaturesRequiredForCrest}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"AP SYNC ERROR: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Re-send all checked locations to the server (in case server missed them).
+    /// </summary>
+    public void ResendChecks()
+    {
+        if (!_connected || _session == null || _checkedLocations.Count == 0) return;
+        try
+        {
+            _session.Locations.CompleteLocationChecks(_checkedLocations.ToArray());
+            Plugin.Log.LogInfo($"AP RESEND: Re-sent {_checkedLocations.Count} location checks");
+        }
+        catch (Exception ex) { Plugin.Log.LogError($"AP RESEND ERROR: {ex.Message}"); }
+    }
+
+    // ---------------------------------------------------------------
+    // Reset
+    // ---------------------------------------------------------------
+
+    public void Reset()
+    {
+        _checkedLocations.Clear();
+        _totalCallbackItemsSeen = 0;
+        _syncedItemCount = 0;
+        _unlockedDoors.Clear();
+        _collectedCardIndices.Clear();
+        _collectedIngredientTypes.Clear();
+        _crestCount = 0;
+        _hasLeftCrest = false;
+        _hasRightCrest = false;
+        _crestDoorUnlocked = false;
+        _crestVisualsPlaced = false;
+        _syncedFromServer = false;
+        _goalSent = false;
+        _ingCheckCounter.Clear();
+        _cookedRecipes.Clear();
+        _discoveredPinnedTypes.Clear();
+        _physicallyUnlockedDoors.Clear();
+        _physicallyGrantedCards.Clear();
+        _physicallyGrantedIngredients.Clear();
+        lock (_receivedItemQueue) { _receivedItemQueue.Clear(); }
+    }
+
+    public void ClearSavedState()
+    {
+        // Full wipe — deletes saved file for a fresh AP session
+        Reset();
+        try { if (File.Exists(_savePath)) File.Delete(_savePath); }
+        catch (Exception ex) { Plugin.Log.LogError($"AP CLEAR ERROR: {ex.Message}"); }
+        Plugin.Log.LogInfo("AP: Saved state cleared.");
+    }
+}
+
+// =====================================================================
+// Chaos Mode Validator — Full Cross-Pool Randomization
+// Validates that a unified assignment of all 77 items across all 77
+// locations is completable: every creature can be fed, every item
+// can be collected, the game can be finished.
+// =====================================================================
+public static class ChaosValidator
+{
+    // ===== Pool sizes =====
+    public const int NUM_KEYS = 10;        // 8 room keys + Pantry + Fridge
+    public const int NUM_CRESTS = 2;
+    public const int NUM_CARDS = 39;       // RecipeLogic.Recipes.Length
+    public const int NUM_INGREDIENTS = 26; // IngredientRandomizer.TOTAL_SLOTS
+    public const int TOTAL = NUM_KEYS + NUM_CRESTS + NUM_CARDS + NUM_INGREDIENTS; // 77
+
+    // ===== Item index ranges =====
+    public const int ITEM_KEY_BASE = 0;      // 0-9:   Keys (door IDs)
+    public const int ITEM_CREST_BASE = 10;   // 10-11: Crests
+    public const int ITEM_CARD_BASE = 12;    // 12-50: Recipe cards
+    public const int ITEM_ING_BASE = 51;     // 51-76: Ingredients
+
+    // Key item index → door ID it opens
+    public static readonly int[] KeyDoorIds = {
+        KeyRandomizer.BEDROOM,        // item 0
+        KeyRandomizer.BATHROOM,       // item 1
+        KeyRandomizer.ODDITIES_ROOM,  // item 2
+        KeyRandomizer.FREEZER,        // item 3
+        KeyRandomizer.CHEESE_CABINET, // item 4
+        KeyRandomizer.SHED,           // item 5
+        KeyRandomizer.MUG_CABINET,    // item 6
+        KeyRandomizer.BOWL_CABINET,   // item 7
+        KeyRandomizer.PANTRY,         // item 8
+        KeyRandomizer.FRIDGE,         // item 9
+    };
+
+    // Reverse lookup: door ID → item index
+    public static readonly Dictionary<int, int> DoorToItemIndex = new();
+
+    // Ingredient item index → UnlockableItemID type
+    public static readonly int[] IngredientTypeIds;
+
+    static ChaosValidator()
+    {
+        IngredientTypeIds = new int[NUM_INGREDIENTS];
+        for (int i = 0; i < NUM_INGREDIENTS; i++)
+            IngredientTypeIds[i] = IngredientRandomizer.Slots[i].OrigType;
+        for (int i = 0; i < KeyDoorIds.Length; i++)
+            DoorToItemIndex[KeyDoorIds[i]] = i;
+    }
+
+    // ===== Location index ranges =====
+    public const int LOC_TABLE = 0;          // Always accessible
+    public const int LOC_CROW = 1;           // Accessible when Crow is fed
+    public const int LOC_ODDITIES = 2;       // Accessible when Oddities Room door open
+    public const int LOC_CREATURE_BASE = 3;  // 3-11: Creature rewards
+    public const int LOC_CARD_BASE = 12;     // 12-50: Card spot locations
+    public const int LOC_ING_BASE = 51;      // 51-76: Ingredient spot locations
+
+    // Maps creature location offset (0-8) → creature ID
+    public static readonly int[] CreatureLocOrder = {
+        KeyRandomizer.RACCOON,       // loc 3
+        KeyRandomizer.RAT,           // loc 4
+        KeyRandomizer.GREY,          // loc 5
+        KeyRandomizer.SASSFOOT,      // loc 6
+        KeyRandomizer.TREE_OCTOPUS,  // loc 7
+        KeyRandomizer.GOOBER,        // loc 8
+        KeyRandomizer.FROG,          // loc 9
+        KeyRandomizer.JAKE,          // loc 10
+        KeyRandomizer.MOTH,          // loc 11
+    };
+
+    // All feedable creature IDs (Crow + 9 standard)
+    static readonly int[] AllCreatureIds = {
+        KeyRandomizer.CROW,
+        KeyRandomizer.RACCOON, KeyRandomizer.RAT, KeyRandomizer.GREY,
+        KeyRandomizer.SASSFOOT, KeyRandomizer.TREE_OCTOPUS, KeyRandomizer.GOOBER,
+        KeyRandomizer.FROG, KeyRandomizer.JAKE, KeyRandomizer.MOTH,
+    };
+
+    // ===== Item classification helpers =====
+    public static bool IsKeyItem(int item) => item >= ITEM_KEY_BASE && item < ITEM_CREST_BASE;
+    public static bool IsCrestItem(int item) => item >= ITEM_CREST_BASE && item < ITEM_CARD_BASE;
+    public static bool IsCardItem(int item) => item >= ITEM_CARD_BASE && item < ITEM_ING_BASE;
+    public static bool IsIngredientItem(int item) => item >= ITEM_ING_BASE && item < TOTAL;
+
+    // ===== Chaos recipe requirements =====
+    // For each recipe: which doors are always required (Fridge/Pantry/Freezer for
+    // non-shuffled ingredients) and which ingredient types must be collected from
+    // the chaos pool.
+    //
+    // In chaos mode, finite ingredients can be ANYWHERE (creature rewards, card spots,
+    // etc.), so vanilla door requirements for finite ingredients are replaced by
+    // "ingredient type must be collected." Only Fridge-only items (Steak, Egg, Milk,
+    // Butter, Strawberry, Lettuce), Pantry-only items (Potato), and pinned items
+    // (Rose→Shed, Cereal→Cereal Cabinet) retain door requirements.
+
+    struct ChaosRecipeReqs
+    {
+        public HashSet<int> FixedDoors;       // Doors needed for non-shuffled ingredients
+        public HashSet<int> CollectibleTypes;  // Ingredient type IDs to collect from chaos pool
+    }
+
+    static ChaosRecipeReqs[] _recipeReqs;
+    static ChaosRecipeReqs[] _defaultRecipeReqs;
+    static bool _reqsBuilt = false;
+
+    static void EnsureRecipeReqs()
+    {
+        if (_reqsBuilt) return;
+
+        _recipeReqs = new ChaosRecipeReqs[NUM_CARDS];
+        for (int i = 0; i < NUM_CARDS; i++)
+            _recipeReqs[i] = BuildRecipeReqs(
+                RecipeLogic.Recipes[i].IngDoors,
+                RecipeLogic.FiniteCosts[i]);
+
+        _defaultRecipeReqs = new ChaosRecipeReqs[RecipeLogic.DefaultRecipes.Length];
+        for (int i = 0; i < RecipeLogic.DefaultRecipes.Length; i++)
+            _defaultRecipeReqs[i] = BuildRecipeReqs(
+                RecipeLogic.DefaultRecipes[i].ingDoors,
+                RecipeLogic.DefaultFiniteCosts[i]);
+
+        _reqsBuilt = true;
+    }
+
+    static ChaosRecipeReqs BuildRecipeReqs(int[] ingDoors, RecipeLogic.IC[] finiteCosts)
+    {
+        var reqs = new ChaosRecipeReqs
+        {
+            FixedDoors = new HashSet<int>(),
+            CollectibleTypes = new HashSet<int>()
+        };
+
+        // Fixed doors: keep only Fridge, Pantry, Freezer from vanilla IngDoors.
+        // These are for non-shuffled ingredients (Steak, Egg, Milk, Butter,
+        // Strawberry, Lettuce from Fridge; Potato from Pantry; Freezer station).
+        foreach (int d in ingDoors)
+        {
+            if (d == KeyRandomizer.FRIDGE || d == KeyRandomizer.PANTRY || d == KeyRandomizer.FREEZER)
+                reqs.FixedDoors.Add(d);
+        }
+
+        // Process finite ingredient costs
+        foreach (var cost in finiteCosts)
+        {
+            // Always available (not in shuffle pool) — skip
+            if (cost.N == "Bread" || cost.N == "Water" || cost.N == "Mushroom")
+                continue;
+
+            // Pinned items — need their fixed door instead of collection
+            if (cost.N == "Rose") { reqs.FixedDoors.Add(KeyRandomizer.SHED); continue; }
+            if (cost.N == "Cereal") { reqs.FixedDoors.Add(KeyRandomizer.CEREAL); continue; }
+
+            // In chaos pool — need to collect from wherever placed
+            int typeId = NameToTypeId(cost.N);
+            if (typeId > 0) reqs.CollectibleTypes.Add(typeId);
+        }
+
+        return reqs;
+    }
+
+    static int NameToTypeId(string name)
+    {
+        foreach (var kvp in IngredientRandomizer.TypeToName)
+            if (kvp.Value == name) return kvp.Key;
+        return -1;
+    }
+
+    // ===== THE SOLVER =====
+    /// <summary>
+    /// Validate that a chaos assignment is completable.
+    /// assignment[locationIndex] = itemIndex, length must be TOTAL (77).
+    /// Returns true if all creatures can be fed and the game can be finished.
+    /// </summary>
+    public static bool IsCompletable(int[] assignment)
+    {
+        EnsureRecipeReqs();
+
+        // ---- Game state ----
+        var openDoors = new HashSet<int> { KeyRandomizer.FRONT_DOOR };
+        var collectedCards = new HashSet<int>();      // recipe indices (0-38)
+        var collectedIngTypes = new HashSet<int>();   // UnlockableItemID type IDs
+        var fedCreatures = new HashSet<int>();        // creature IDs
+        int crestCount = 0;
+        var collected = new HashSet<int>();            // location indices already processed
+
+        bool changed = true;
+        int iterations = 0;
+        const int MAX_ITERATIONS = 100; // Safety valve
+
+        while (changed && iterations < MAX_ITERATIONS)
+        {
+            changed = false;
+            iterations++;
+
+            // --- Phase 1: Collect items from all newly accessible locations ---
+            for (int loc = 0; loc < TOTAL; loc++)
+            {
+                if (collected.Contains(loc)) continue;
+                if (!IsLocationAccessible(loc, openDoors, fedCreatures,
+                        collectedCards, collectedIngTypes))
+                    continue;
+
+                collected.Add(loc);
+                int item = assignment[loc];
+                changed = true;
+
+                if (IsKeyItem(item))
+                {
+                    int doorId = KeyDoorIds[item - ITEM_KEY_BASE];
+                    openDoors.Add(doorId);
+                }
+                else if (IsCrestItem(item))
+                {
+                    crestCount++;
+                }
+                else if (IsCardItem(item))
+                {
+                    int recipeIdx = item - ITEM_CARD_BASE;
+                    collectedCards.Add(recipeIdx);
+                }
+                else if (IsIngredientItem(item))
+                {
+                    int typeId = IngredientTypeIds[item - ITEM_ING_BASE];
+                    collectedIngTypes.Add(typeId);
+                }
+            }
+
+            // --- Phase 2: Feed creatures whose requirements are now met ---
+            foreach (int creature in AllCreatureIds)
+            {
+                if (fedCreatures.Contains(creature)) continue;
+
+                if (CanFeedCreature(creature, collectedCards, collectedIngTypes, openDoors))
+                {
+                    fedCreatures.Add(creature);
+                    changed = true;
+                }
+            }
+        }
+
+        // Win condition: all 9 standard creatures fed
+        // (Crow feeding is implicit — needed only if Crow's reward is critical)
+        int standardFed = 0;
+        foreach (int c in CreatureLocOrder)
+            if (fedCreatures.Contains(c)) standardFed++;
+
+        return standardFed >= CreatureLocOrder.Length;
+    }
+
+    // ===== Location accessibility =====
+    static bool IsLocationAccessible(int loc, HashSet<int> openDoors,
+        HashSet<int> fedCreatures, HashSet<int> collectedCards,
+        HashSet<int> collectedIngTypes)
+    {
+        // Starting table: always accessible
+        if (loc == LOC_TABLE) return true;
+
+        // Crow reward: Crow must be fed
+        if (loc == LOC_CROW) return fedCreatures.Contains(KeyRandomizer.CROW);
+
+        // Oddities puzzle: Oddities Room door must be open
+        if (loc == LOC_ODDITIES) return openDoors.Contains(KeyRandomizer.ODDITIES_ROOM);
+
+        // Creature reward: that creature must be fed
+        if (loc >= LOC_CREATURE_BASE && loc < LOC_CARD_BASE)
+        {
+            int creatureId = CreatureLocOrder[loc - LOC_CREATURE_BASE];
+            return fedCreatures.Contains(creatureId);
+        }
+
+        // Card spot: all location doors must be open
+        if (loc >= LOC_CARD_BASE && loc < LOC_ING_BASE)
+        {
+            int recipeIdx = loc - LOC_CARD_BASE;
+            foreach (int d in RecipeLogic.Recipes[recipeIdx].LocDoors)
+                if (!openDoors.Contains(d)) return false;
+            return true;
+        }
+
+        // Ingredient spot: door must be open (0 = kitchen, always accessible)
+        if (loc >= LOC_ING_BASE && loc < TOTAL)
+        {
+            int slotIdx = loc - LOC_ING_BASE;
+            int door = IngredientRandomizer.Slots[slotIdx].Door;
+            return door == 0 || openDoors.Contains(door);
+        }
+
+        return false;
+    }
+
+    // ===== Creature feeding =====
+    static bool CanFeedCreature(int creatureId, HashSet<int> collectedCards,
+        HashSet<int> collectedIngTypes, HashSet<int> openDoors)
+    {
+        // Crow: needs 2 distinct cookable recipes (including defaults)
+        if (creatureId == KeyRandomizer.CROW)
+            return CountAllCookable(collectedCards, collectedIngTypes, openDoors) >= 2;
+
+        // Tree Octopus: Fish (type 7) must be collected to summon
+        if (creatureId == KeyRandomizer.TREE_OCTOPUS)
+        {
+            if (!collectedIngTypes.Contains(7)) return false; // Fish = type 7
+        }
+
+        // Check each need from CreatureCardNeeds
+        foreach (var need in RecipeLogic.CreatureCardNeeds)
+        {
+            if (need.CreatureId != creatureId) continue;
+            int cookable = CountCookableOfType(need.TypeFlag,
+                collectedCards, collectedIngTypes, openDoors);
+            if (cookable < need.Count) return false;
+        }
+        return true;
+    }
+
+    // ===== Recipe cookability =====
+    /// <summary>Count all distinct cookable recipes (defaults + collected cards).</summary>
+    static int CountAllCookable(HashSet<int> collectedCards,
+        HashSet<int> collectedIngTypes, HashSet<int> openDoors)
+    {
+        int count = 0;
+        for (int i = 0; i < _defaultRecipeReqs.Length; i++)
+            if (IsCookable(_defaultRecipeReqs[i], collectedIngTypes, openDoors)) count++;
+        foreach (int ri in collectedCards)
+            if (IsCookable(_recipeReqs[ri], collectedIngTypes, openDoors)) count++;
+        return count;
+    }
+
+    /// <summary>Count cookable recipes matching a type flag.</summary>
+    static int CountCookableOfType(int typeFlag, HashSet<int> collectedCards,
+        HashSet<int> collectedIngTypes, HashSet<int> openDoors)
+    {
+        int count = 0;
+        // Check defaults
+        for (int i = 0; i < RecipeLogic.DefaultRecipes.Length; i++)
+        {
+            if ((RecipeLogic.DefaultRecipes[i].types & typeFlag) != 0
+                && IsCookable(_defaultRecipeReqs[i], collectedIngTypes, openDoors))
+                count++;
+        }
+        // Check collected non-default cards
+        foreach (int ri in collectedCards)
+        {
+            if ((RecipeLogic.Recipes[ri].Types & typeFlag) != 0
+                && IsCookable(_recipeReqs[ri], collectedIngTypes, openDoors))
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Is a recipe cookable given current state?
+    /// Checks fixed door requirements (Fridge/Pantry/Freezer/pinned)
+    /// and collectible ingredient availability.
+    /// </summary>
+    static bool IsCookable(ChaosRecipeReqs reqs,
+        HashSet<int> collectedIngTypes, HashSet<int> openDoors)
+    {
+        foreach (int d in reqs.FixedDoors)
+            if (!openDoors.Contains(d)) return false;
+        foreach (int t in reqs.CollectibleTypes)
+            if (!collectedIngTypes.Contains(t)) return false;
+        return true;
+    }
+
+    // ===== Item name helpers (for logging/spoiler) =====
+    public static string ItemName(int item)
+    {
+        if (IsKeyItem(item)) return KeyRandomizer.ItemName(KeyDoorIds[item - ITEM_KEY_BASE]);
+        if (IsCrestItem(item)) return $"Crest Half #{item - ITEM_CREST_BASE + 1}";
+        if (IsCardItem(item))
+        {
+            int ri = item - ITEM_CARD_BASE;
+            return ri < RecipeLogic.Recipes.Length ? RecipeLogic.Recipes[ri].Name : $"Card#{ri}";
+        }
+        if (IsIngredientItem(item))
+        {
+            int typeId = IngredientTypeIds[item - ITEM_ING_BASE];
+            return IngredientRandomizer.TypeToName.TryGetValue(typeId, out string n) ? n : $"Ing#{typeId}";
+        }
+        return $"Item#{item}";
+    }
+
+    public static string LocationName(int loc)
+    {
+        if (loc == LOC_TABLE) return "Starting Table";
+        if (loc == LOC_CROW) return "Crow Reward";
+        if (loc == LOC_ODDITIES) return "Oddities Puzzle";
+        if (loc >= LOC_CREATURE_BASE && loc < LOC_CARD_BASE)
+        {
+            int cid = CreatureLocOrder[loc - LOC_CREATURE_BASE];
+            return KeyRandomizer.CreatureNames.TryGetValue(cid, out string n)
+                ? $"{n} Reward" : $"Creature{cid} Reward";
+        }
+        if (loc >= LOC_CARD_BASE && loc < LOC_ING_BASE)
+        {
+            int ri = loc - LOC_CARD_BASE;
+            return ri < RecipeLogic.Recipes.Length
+                ? $"Card: {RecipeLogic.Recipes[ri].Name}" : $"CardSpot#{ri}";
+        }
+        if (loc >= LOC_ING_BASE && loc < TOTAL)
+        {
+            int si = loc - LOC_ING_BASE;
+            int origType = IngredientRandomizer.Slots[si].OrigType;
+            int door = IngredientRandomizer.Slots[si].Door;
+            string typeName = IngredientRandomizer.TypeToName.TryGetValue(origType, out string n) ? n : $"?{origType}";
+            string doorName = door > 0
+                ? KeyRandomizer.DoorNames.GetValueOrDefault(door, $"Door{door}")
+                : "Kitchen";
+            return $"Ingredient: {typeName} spot ({doorName})";
+        }
+        return $"Loc#{loc}";
+    }
+}
+
+// =====================================================================
 // Harmony Patches
 // =====================================================================
 
@@ -2752,7 +4980,10 @@ public class NewGamePatch
         Plugin.Randomizer.PrepareForNewGame();
         Plugin.KeyRando.PrepareForNewGame();
         Plugin.IngredientRando.PrepareForNewGame();
+        Plugin.ChaosRando.PrepareForNewGame();
         IngredientSwapPatch.Reset();
+        IngredientDebugPatch.Reset();
+        APItemPickupPatch.Reset();
         KeyRewardGifterPatch.Reset();
         CrestHalfSwapPatch.ResetTracking();
 
@@ -2772,17 +5003,68 @@ public class NewGamePatch
         }
         Plugin.ActiveSeed = seed;
 
-        // Create one shared RNG from the seed — key shuffle consumes
-        // from it first, then ingredient shuffle, then card shuffle.
+        bool apMode = Plugin.EnableArchipelago.Value;
+        bool chaosMode = Plugin.EnableChaosMode.Value;
+
+        // Create one shared RNG from the seed
         var rng = new System.Random(seed);
-        Plugin.KeyRando.SetRng(rng);
-        Plugin.IngredientRando.SetRng(rng);
-        Plugin.Randomizer.SetRng(rng);
+
+        if (apMode)
+        {
+            // Archipelago mode: connect to server, suppress all local randomizers
+            Plugin.APClient.Reset();
+            Plugin.APClient.Connect();
+            APUpdateRunner.EnsureRunning();
+
+            // Wipe vanilla save data that could carry over from previous sessions
+            // (prevents cereal/ingredients/cards from appearing before AP grants them)
+            try
+            {
+                var settings = UnityEngine.Object.FindObjectOfType<GlobalPlayerSettings>();
+                if (settings != null && settings.m_SaveData != null)
+                {
+                    settings.m_SaveData.m_IngredientsUnlocked = "";
+                    settings.m_SaveData.m_RecipeCardsUnlocked = "";
+                    settings.m_SaveData.m_iCreaturesForPantsVisit = 0;
+                    settings.m_SaveData.m_iPantsVisitCount = 0;
+                    Plugin.Log.LogInfo("AP: Wiped vanilla save data (ingredients, cards, Pants state)");
+                }
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning($"AP SAVE WIPE: {ex.Message}"); }
+
+            // Suppress all local randomizers
+            Plugin.KeyRando.SuppressForChaos();
+            Plugin.IngredientRando.SuppressForChaos();
+            Plugin.Randomizer.SuppressForChaos();
+            Plugin.ChaosRando.PrepareForNewGame();
+        }
+        else if (chaosMode)
+        {
+            // Chaos mode: single unified randomizer handles everything
+            Plugin.ChaosRando.SetRng(rng);
+            Plugin.ChaosRando.Initialize();
+
+            // Suppress normal randomizers so stray Initialize() calls are no-ops
+            Plugin.KeyRando.SuppressForChaos();
+            Plugin.IngredientRando.SuppressForChaos();
+            Plugin.Randomizer.SuppressForChaos();
+        }
+        else
+        {
+            // Normal mode: sequential key → ingredient → card pipeline
+            Plugin.KeyRando.SetRng(rng);
+            Plugin.IngredientRando.SetRng(rng);
+            Plugin.Randomizer.SetRng(rng);
+        }
 
         Plugin.Log.LogInfo($"========================================");
         Plugin.Log.LogInfo($"  SEED: {seed}");
-        Plugin.Log.LogInfo($"  Pantry Shuffle: {Plugin.EnablePantryShuffle.Value}");
-        Plugin.Log.LogInfo($"  Ingredient Shuffle: {Plugin.EnableIngredientShuffle.Value}");
+        Plugin.Log.LogInfo($"  Mode: {(apMode ? "ARCHIPELAGO" : chaosMode ? "CHAOS" : "Normal")}");
+        if (!chaosMode && !apMode)
+        {
+            Plugin.Log.LogInfo($"  Pantry Shuffle: {Plugin.EnablePantryShuffle.Value}");
+            Plugin.Log.LogInfo($"  Ingredient Shuffle: {Plugin.EnableIngredientShuffle.Value}");
+        }
         Plugin.Log.LogInfo($"========================================");
 
         // Persist seed so it survives continue-game and can be shared
@@ -2828,7 +5110,7 @@ public class MainMenuVersionPatch
             var tmp = go.AddComponent<TextMeshProUGUI>();
             tmp.text = $"{Plugin.MOD_NAME} v{Plugin.VERSION}";
             tmp.fontSize = 16;
-            tmp.color = new Color(1f, 1f, 1f, 0.5f);
+            tmp.color = new UnityEngine.Color(1f, 1f, 1f, 0.5f);
             tmp.alignment = TextAlignmentOptions.BottomRight;
             tmp.raycastTarget = false;
 
@@ -2955,8 +5237,24 @@ public class MainMenuResumePatch
 [HarmonyPatch(typeof(RecipeCard), nameof(RecipeCard.Start))]
 public class RecipeCardStartPatch
 {
+    // Prefix: In AP mode, skip Start entirely to prevent CheckForCardAlreadyFound
+    // from destroying cards whose recipe has been AP-granted
+    static bool Prefix(RecipeCard __instance)
+    {
+        if (Plugin.EnableArchipelago.Value) return false; // Skip Start — cards stay in world
+        return true;
+    }
+
     static void Postfix(RecipeCard __instance)
     {
+        if (Plugin.EnableArchipelago.Value) return;
+
+        if (Plugin.EnableChaosMode.Value)
+        {
+            HandleChaosCardSpot(__instance);
+            return;
+        }
+
         if (!Plugin.EnableCardShuffle.Value) return;
 
         if (!Plugin.IsNewGame && !Plugin.Randomizer.HasMapping)
@@ -2971,17 +5269,253 @@ public class RecipeCardStartPatch
             __instance.m_RecipeCardUnlocked = newCard;
         }
     }
+
+    static void HandleChaosCardSpot(RecipeCard cardInstance)
+    {
+        if (!Plugin.ChaosRando.HasMapping) return;
+
+        var vanillaCard = cardInstance.m_RecipeCardUnlocked;
+        if (vanillaCard == null) return;
+
+        string vanillaTitle = vanillaCard.GetRecipeTitle();
+
+        // Find recipe index
+        int recipeIdx = -1;
+        for (int i = 0; i < RecipeLogic.Recipes.Length; i++)
+        {
+            if (RecipeLogic.Recipes[i].Name == vanillaTitle) { recipeIdx = i; break; }
+        }
+        if (recipeIdx < 0)
+        {
+            Plugin.Log.LogWarning($"CHAOS CARD SPOT: Unknown recipe '{vanillaTitle}'");
+            return;
+        }
+
+        int item = Plugin.ChaosRando.GetItemAtCardSpot(recipeIdx);
+        if (item < 0) return;
+
+        // Card → card: swap recipe data
+        if (ChaosValidator.IsCardItem(item))
+        {
+            int newRecipeIdx = item - ChaosValidator.ITEM_CARD_BASE;
+            if (newRecipeIdx == recipeIdx) return; // Same card, no swap needed
+
+            string targetName = RecipeLogic.Recipes[newRecipeIdx].Name;
+            var allCards = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+            var newCard = allCards?.FirstOrDefault(c => c.GetRecipeTitle() == targetName);
+            if (newCard != null)
+            {
+                Plugin.Log.LogInfo($"CHAOS CARD SPOT: {vanillaTitle} -> {targetName} (card swap)");
+                cardInstance.m_RecipeCardUnlocked = newCard;
+            }
+            else
+                Plugin.Log.LogWarning($"CHAOS CARD SPOT: Could not find RecipeCardData for '{targetName}'");
+            return;
+        }
+
+        // Non-card item at card spot → spawn physical item, destroy card
+        var cardGO = cardInstance.gameObject;
+        var pos = cardGO.transform.position;
+        var rot = cardGO.transform.rotation;
+
+        try
+        {
+            if (ChaosValidator.IsKeyItem(item))
+            {
+                int doorId = ChaosValidator.KeyDoorIds[item - ChaosValidator.ITEM_KEY_BASE];
+                SpawnKeyAtPosition(pos, rot, doorId, vanillaTitle);
+                DisableCard(cardGO);
+            }
+            else if (ChaosValidator.IsCrestItem(item))
+            {
+                SpawnCrestAtPosition(pos, rot, vanillaTitle);
+                DisableCard(cardGO);
+            }
+            else if (ChaosValidator.IsIngredientItem(item))
+            {
+                int typeId = ChaosValidator.IngredientTypeIds[item - ChaosValidator.ITEM_ING_BASE];
+                SpawnIngredientAtPosition(pos, rot, typeId, vanillaTitle);
+                DisableCard(cardGO);
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"CHAOS CARD SPOT ERROR: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    public static void SpawnKeyAtPosition(Vector3 pos, Quaternion rot, int doorId, string spotName)
+    {
+        KeyRewardGifterPatch.EnsurePrefabsCached();
+        var prefab = KeyRewardGifterPatch.CachedKeyPrefab;
+        if (prefab == null)
+        {
+            Plugin.Log.LogWarning($"CHAOS CARD SPOT: No key prefab cached for {KeyRandomizer.ItemName(doorId)} at {spotName}");
+            return;
+        }
+
+        var spawned = UnityEngine.Object.Instantiate(prefab, pos + Vector3.up * 0.3f, rot);
+        var key = spawned.GetComponent<Key>();
+        if (key != null) key.m_KeyID = (DoorLockID)doorId;
+
+        // Prevent Lost and Found from stealing chaos-placed keys
+        var item = spawned.GetComponent<Item>();
+        if (item != null)
+        {
+            item.m_bImportantItem = false;
+            item.m_bRespawnable = false;
+        }
+
+        // Mark so KeyStartPatch doesn't re-remap this key
+        if (key != null) KeyRandomizer.AlreadyRemappedKeys.Add(key.GetInstanceID());
+
+        Plugin.Log.LogInfo($"CHAOS CARD SPOT: Spawned {KeyRandomizer.ItemName(doorId)} at {spotName} spot");
+    }
+
+    public static void SpawnCrestAtPosition(Vector3 pos, Quaternion rot, string spotName)
+    {
+        KeyRewardGifterPatch.EnsurePrefabsCached();
+        var prefab = KeyRewardGifterPatch.CachedCrestPrefab;
+        if (prefab == null)
+        {
+            Plugin.Log.LogWarning($"CHAOS CARD SPOT: No crest prefab cached at {spotName}");
+            return;
+        }
+
+        var spawned = UnityEngine.Object.Instantiate(prefab, pos + Vector3.up * 0.3f, rot);
+        var crest = spawned.GetComponent<CrestHalf>();
+        if (crest != null)
+            crest.m_CrestSide = KeyRandomizer.NextCrestSide();
+
+        // Prevent Lost and Found from stealing chaos-placed crests
+        var item = spawned.GetComponent<Item>();
+        if (item != null)
+        {
+            item.m_bImportantItem = false;
+            item.m_bRespawnable = false;
+        }
+
+        // Track to prevent CrestHalfSwapPatch double-counting
+        if (crest != null) CrestHalfSwapPatch.TrackConverted(crest.GetInstanceID());
+
+        Plugin.Log.LogInfo($"CHAOS CARD SPOT: Spawned Crest at {spotName} spot");
+    }
+
+    public static void SpawnIngredientAtPosition(Vector3 pos, Quaternion rot, int typeId, string spotName)
+    {
+        // Find an existing ItemUnlockable in the scene to use as template
+        GameObject template = null;
+        foreach (var u in Resources.FindObjectsOfTypeAll<ItemUnlockable>())
+        {
+            // Skip Pantry/Fridge copies
+            if (IngredientSwapPatch.IsInfiniteSpawnSource(u.transform)) continue;
+            // Prefer one with matching type, but any will do
+            if ((int)u.GetUnlockItemID() == typeId)
+            {
+                template = u.gameObject;
+                break;
+            }
+            if (template == null && (int)u.GetUnlockItemID() > 0)
+                template = u.gameObject;
+        }
+
+        if (template == null)
+        {
+            Plugin.Log.LogWarning($"CHAOS CARD SPOT: No ingredient template found for type {typeId} at {spotName}");
+            return;
+        }
+
+        var spawned = UnityEngine.Object.Instantiate(template, pos + Vector3.up * 0.3f, rot);
+        spawned.SetActive(true);
+
+        // Set correct type and force spawn
+        var unlockable = spawned.GetComponent<ItemUnlockable>();
+        if (unlockable != null)
+        {
+            unlockable.m_UnlockableItemID = (UnlockableItemID)typeId;
+            unlockable.m_bForceSpawn = true;
+        }
+
+        // Prevent Lost and Found interference
+        var itemComp = spawned.GetComponent<Item>();
+        if (itemComp != null)
+        {
+            itemComp.m_bImportantItem = false;
+            itemComp.m_bRespawnable = false;
+        }
+
+        // Apply correct visuals
+        IngredientRandomizer.EnsureVisualsCached();
+        IngredientRandomizer.ApplyVisualSwap(spawned, typeId, typeId);
+
+        // Mark so IngredientSwapPatch doesn't re-process
+        IngredientSwapPatch.MarkSwapped(spawned.GetComponent<ItemUnlockable>()?.GetInstanceID() ?? -1);
+
+        string typeName = IngredientRandomizer.TypeToName.TryGetValue(typeId, out string n) ? n : $"Type{typeId}";
+        Plugin.Log.LogInfo($"CHAOS CARD SPOT: Spawned {typeName} at {spotName} spot");
+    }
+
+    static void DisableCard(GameObject cardGO)
+    {
+        // Disable instead of destroy — the card's position data may be needed and
+        // destroying mid-Start can cause issues
+        cardGO.SetActive(false);
+    }
 }
 
 [HarmonyPatch(typeof(RecipeCard), nameof(RecipeCard.ObtainCard))]
 public class RecipeCardObtainPatch
 {
+    // Prefix: In AP mode, skip the original ObtainCard entirely.
+    // The card pickup is just a check trigger — player shouldn't learn the original recipe.
+    static bool Prefix(RecipeCard __instance)
+    {
+        if (!Plugin.EnableArchipelago.Value) return true; // Run original
+
+        // Bypass: AP is granting this card, let ObtainCard run to fire the event
+        if (Plugin.APClient.GrantingFromAP) return true;
+
+        var cardData = __instance.m_RecipeCardUnlocked;
+        if (cardData == null) return false;
+
+        string title = cardData.GetRecipeTitle();
+        for (int i = 0; i < RecipeLogic.Recipes.Length; i++)
+        {
+            if (RecipeLogic.Recipes[i].Name == title)
+            {
+                Plugin.APClient.CheckCardSpot(i);
+                Plugin.Log.LogInfo($"AP CHECK: Card spot {i} ({title})");
+                break;
+            }
+        }
+
+        return false; // Skip original ObtainCard — don't learn this recipe
+    }
+
     static void Postfix(RecipeCard __instance)
     {
-        if (!Plugin.EnableCardShuffle.Value) return;
+        if (Plugin.EnableArchipelago.Value) return; // Already handled in Prefix
+
         var cardData = __instance.m_RecipeCardUnlocked;
         if (cardData == null) return;
-        Plugin.Randomizer.CollectRecipe(cardData.GetRecipeTitle());
+
+        string title = cardData.GetRecipeTitle();
+
+        if (Plugin.EnableChaosMode.Value)
+        {
+            for (int i = 0; i < RecipeLogic.Recipes.Length; i++)
+            {
+                if (RecipeLogic.Recipes[i].Name == title)
+                {
+                    Plugin.ChaosRando.CollectCard(i);
+                    break;
+                }
+            }
+            return;
+        }
+
+        if (!Plugin.EnableCardShuffle.Value) return;
+        Plugin.Randomizer.CollectRecipe(title);
     }
 }
 
@@ -2990,24 +5524,55 @@ public class MistakeIfNotCollectedPatch
 {
     static void Postfix(RecipeMasterList __instance, ref RecipeData __result)
     {
-        if (!Plugin.EnableMistakeSystem.Value || !Plugin.EnableCardShuffle.Value) return;
+        if (!Plugin.EnableMistakeSystem.Value) return;
         if (__result == null) return;
+
+        bool isAP = Plugin.EnableArchipelago.Value;
+
+        // In non-AP modes, require CardShuffle to be on
+        if (!isAP && !Plugin.EnableCardShuffle.Value) return;
+        if (!isAP && Plugin.EnableChaosMode.Value) return; // Chaos mode has own mistake tracking
 
         var foodData = __result.GetFoodData();
         string foodName = foodData != null ? foodData.name : null;
         string cardTitle = FindCardTitleForRecipe(__result);
 
         bool isKnown = false;
-        if (foodName != null && Plugin.Randomizer.IsRecipeCollected(foodName)) isKnown = true;
-        if (!isKnown && cardTitle != null && Plugin.Randomizer.IsRecipeCollected(cardTitle)) isKnown = true;
+
+        if (isAP)
+        {
+            // AP mode: check if we've received this recipe card from the server
+            if (cardTitle != null)
+            {
+                bool inAPPool = false;
+                for (int i = 0; i < RecipeLogic.Recipes.Length; i++)
+                {
+                    if (RecipeLogic.Recipes[i].Name == cardTitle)
+                    {
+                        inAPPool = true;
+                        isKnown = Plugin.APClient.HasCard(i);
+                        break;
+                    }
+                }
+                // Not in AP pool = default recipe (Toast, Pancake, etc.) — always cookable
+                if (!inAPPool) isKnown = true;
+            }
+        }
+        else
+        {
+            // Local mode: check local collected recipes
+            if (foodName != null && Plugin.Randomizer.IsRecipeCollected(foodName)) isKnown = true;
+            if (!isKnown && cardTitle != null && Plugin.Randomizer.IsRecipeCollected(cardTitle)) isKnown = true;
+        }
 
         if (isKnown) return;
 
         var mistakeList = __instance.m_MistakeMealData;
         if (mistakeList != null && mistakeList.Count > 0)
         {
-            Plugin.Log.LogInfo($"COOK BLOCKED: {cardTitle ?? foodName} - not collected! Forcing Mistake.");
-            __result = mistakeList[0];
+            int idx = UnityEngine.Random.Range(0, mistakeList.Count);
+            Plugin.Log.LogInfo($"COOK BLOCKED: {cardTitle ?? foodName} - not collected! Forcing Mistake #{idx}.{(isAP ? " (AP mode)" : "")}");
+            __result = mistakeList[idx];
         }
     }
 
@@ -3034,6 +5599,18 @@ public class KeyStartPatch
 {
     static void Postfix(Key __instance)
     {
+        if (Plugin.EnableArchipelago.Value)
+        {
+            HandleAPKey(__instance);
+            return;
+        }
+
+        if (Plugin.EnableChaosMode.Value)
+        {
+            HandleChaosKey(__instance);
+            return;
+        }
+
         if (!Plugin.EnableKeyShuffle.Value) return;
         if (KeyRandomizer.AlreadyRemappedKeys.Contains(__instance.GetInstanceID())) return;
 
@@ -3079,6 +5656,116 @@ public class KeyStartPatch
             }
         }
     }
+
+    static void HandleChaosKey(Key __instance)
+    {
+        if (!Plugin.ChaosRando.HasMapping) return;
+        if (KeyRandomizer.AlreadyRemappedKeys.Contains(__instance.GetInstanceID())) return;
+
+        int currentId = (int)__instance.GetKeyID();
+        int chaosItem = -1;
+        string sourceName = null;
+
+        // Starting table key = Pantry (DoorLockID 4)
+        if (currentId == KeyRandomizer.PANTRY && !__instance.gameObject.name.Contains("(Clone)"))
+        {
+            chaosItem = Plugin.ChaosRando.GetTableItem();
+            sourceName = "Table";
+        }
+        // Crow reward key = Fridge (DoorLockID 5), always a clone
+        else if (currentId == KeyRandomizer.FRIDGE && __instance.gameObject.name.Contains("(Clone)"))
+        {
+            chaosItem = Plugin.ChaosRando.GetItemAtLocation(ChaosValidator.LOC_CROW);
+            sourceName = "Crow";
+        }
+        // Oddities puzzle key — DoorLockID for oddities puzzle reward varies
+        // (it's normally a crest, handled by CrestHalfSwapPatch, but Key.Start
+        // won't fire for crests. If somehow a key spawns from oddities, skip.)
+        else
+        {
+            return; // Not a chaos-relevant key source
+        }
+
+        if (chaosItem < 0) return;
+
+        var go = __instance.gameObject;
+        var pos = go.transform.position;
+        var rot = go.transform.rotation;
+
+        try
+        {
+            if (ChaosValidator.IsKeyItem(chaosItem))
+            {
+                // Different key
+                int doorId = ChaosValidator.KeyDoorIds[chaosItem - ChaosValidator.ITEM_KEY_BASE];
+                if (doorId != currentId)
+                {
+                    __instance.m_KeyID = (DoorLockID)doorId;
+                    Plugin.Log.LogInfo($"CHAOS {sourceName}: Key DoorLockID {currentId} -> {doorId} ({KeyRandomizer.ItemName(doorId)})");
+                }
+                KeyRandomizer.AlreadyRemappedKeys.Add(__instance.GetInstanceID());
+            }
+            else if (ChaosValidator.IsCrestItem(chaosItem))
+            {
+                RecipeCardStartPatch.SpawnCrestAtPosition(pos, rot, sourceName);
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS {sourceName}: Key -> Crest");
+            }
+            else if (ChaosValidator.IsCardItem(chaosItem))
+            {
+                int recipeIdx = chaosItem - ChaosValidator.ITEM_CARD_BASE;
+                Plugin.ChaosRando.CollectCard(recipeIdx);
+                string recipeName = RecipeLogic.Recipes[recipeIdx].Name;
+
+                var allCards = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+                var cardData = allCards?.FirstOrDefault(c => c.GetRecipeTitle() == recipeName);
+                if (cardData != null)
+                    RecipeCard.RecipeCardFoundEvent?.Invoke(cardData);
+
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS {sourceName}: Key -> {recipeName} (card auto-granted)");
+            }
+            else if (ChaosValidator.IsIngredientItem(chaosItem))
+            {
+                int typeId = ChaosValidator.IngredientTypeIds[chaosItem - ChaosValidator.ITEM_ING_BASE];
+                RecipeCardStartPatch.SpawnIngredientAtPosition(pos, rot, typeId, sourceName);
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS {sourceName}: Key -> {IngredientRandomizer.TypeToName.GetValueOrDefault(typeId, "?")} (ingredient)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"CHAOS {sourceName} ERROR: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    static void HandleAPKey(Key __instance)
+    {
+        int currentId = (int)__instance.GetKeyID();
+        bool isClone = __instance.gameObject.name.Contains("(Clone)");
+
+        // Table key: Pantry (DoorLockID 4), non-clone
+        if (currentId == KeyRandomizer.PANTRY && !isClone)
+        {
+            // Table key stays visible — APItemPickupPatch handles check on pickup
+            // Mark as non-important so Lost and Found doesn't grab it
+            var item = __instance.GetComponent<Item>();
+            if (item != null)
+            {
+                item.m_bImportantItem = false;
+                item.m_bRespawnable = false;
+            }
+            return;
+        }
+        // Crow reward: Fridge (DoorLockID 5), always a clone — spawns from feeding
+        else if (currentId == KeyRandomizer.FRIDGE && isClone)
+        {
+            Plugin.APClient.CheckCrowLocation();
+            Plugin.Log.LogInfo("AP CHECK: Crow Reward (Fridge key clone)");
+            // Destroy the spawned key — doors auto-unlock in AP mode
+            UnityEngine.Object.Destroy(__instance.gameObject);
+        }
+    }
 }
 
 [HarmonyPatch(typeof(CreatureRewardGifter), nameof(CreatureRewardGifter.SpawnRewardItem))]
@@ -3092,6 +5779,7 @@ public class KeyRewardGifterPatch
     static HashSet<int> _keysBefore;
     static HashSet<int> _crestsBefore;
     static int _targetItem = -1, _creatureId = -1;
+    static int _chaosItem = -1;  // Chaos mode: full item index from ChaosValidator
     static bool _isMothGifter = false;
     static GameObject _originalPrefab = null; // to restore after spawn
     static GameObject _originalFinalPrefab = null; // to restore m_FinalRoomKeyPrefabReward
@@ -3132,20 +5820,34 @@ public class KeyRewardGifterPatch
         }
     }
 
-    static void Prefix(CreatureRewardGifter __instance)
+    static bool Prefix(CreatureRewardGifter __instance)
     {
         _targetItem = -1; _creatureId = -1; _keysBefore = null; _crestsBefore = null;
         _isMothGifter = false; _originalPrefab = null; _originalFinalPrefab = null;
+        _chaosItem = -1;
         SpawnInProgress = true;
-        if (!Plugin.EnableKeyShuffle.Value) return;
 
         var reward = __instance.m_PrefabReward;
-        if (reward == null) return;
+        if (reward == null) return true;
 
-        // Ensure we have both prefab references cached
         CachePrefabs();
-
         _creatureId = KeyRandomizer.IdentifyCreatureFromGifter(__instance);
+
+        // AP mode: don't spawn any reward item, just identify the creature
+        // The Postfix will send the AP check
+        if (Plugin.EnableArchipelago.Value)
+        {
+            Plugin.Log.LogInfo($"AP: Suppressed creature reward spawn for creature {_creatureId}");
+            return false; // Skip SpawnRewardItem entirely
+        }
+
+        if (Plugin.EnableChaosMode.Value)
+        {
+            HandleChaosPrefixCreatureReward(__instance);
+            return true;
+        }
+
+        if (!Plugin.EnableKeyShuffle.Value) return true;
 
         // Detect Moth: reward has CrestHalf, or creature type is MOTH
         bool hasCrestReward = reward.GetComponent<CrestHalf>() != null;
@@ -3164,7 +5866,7 @@ public class KeyRewardGifterPatch
             if (t.HasValue) target = t.Value;
         }
 
-        if (target < 0) return;
+        if (target < 0) return true;
         _targetItem = target;
 
         bool isCrestTarget = (_targetItem == KeyRandomizer.CREST_LEFT || _targetItem == KeyRandomizer.CREST_RIGHT);
@@ -3212,6 +5914,67 @@ public class KeyRewardGifterPatch
             _crestsBefore.Add(c.GetInstanceID());
 
         Plugin.Log.LogInfo($"KEY GIFTER PRE: Creature {_creatureId} (moth={_isMothGifter}) target={KeyRandomizer.ItemName(_targetItem)}");
+        return true;
+    }
+
+    static void HandleChaosPrefixCreatureReward(CreatureRewardGifter __instance)
+    {
+        if (!Plugin.ChaosRando.HasMapping || _creatureId <= 0) return;
+
+        int chaosItem = Plugin.ChaosRando.GetCreatureRewardItem(_creatureId);
+        if (chaosItem < 0) return;
+        _chaosItem = chaosItem;
+
+        bool vanillaIsMoth = (_creatureId == KeyRandomizer.MOTH)
+            || (__instance.m_PrefabReward?.GetComponent<CrestHalf>() != null);
+
+        if (ChaosValidator.IsKeyItem(chaosItem))
+        {
+            // Need key prefab — swap if creature normally gives crest (moth)
+            if (vanillaIsMoth && _cachedKeyPrefab != null)
+            {
+                _originalPrefab = __instance.m_PrefabReward;
+                __instance.m_PrefabReward = _cachedKeyPrefab;
+                _originalFinalPrefab = __instance.m_FinalRoomKeyPrefabReward;
+                __instance.m_FinalRoomKeyPrefabReward = _cachedKeyPrefab;
+            }
+            // Snapshot keys before spawn
+            _keysBefore = new HashSet<int>();
+            foreach (var k in UnityEngine.Object.FindObjectsOfType<Key>())
+                _keysBefore.Add(k.GetInstanceID());
+
+            Plugin.Log.LogInfo($"CHAOS CREATURE: Creature {_creatureId} -> {ChaosValidator.ItemName(chaosItem)} (key)");
+        }
+        else if (ChaosValidator.IsCrestItem(chaosItem))
+        {
+            // Need crest prefab — swap if creature normally gives key (non-moth)
+            if (!vanillaIsMoth && _cachedCrestPrefab != null)
+            {
+                _originalPrefab = __instance.m_PrefabReward;
+                __instance.m_PrefabReward = _cachedCrestPrefab;
+                _originalFinalPrefab = __instance.m_FinalRoomKeyPrefabReward;
+                __instance.m_FinalRoomKeyPrefabReward = _cachedCrestPrefab;
+            }
+            // Snapshot crests before spawn
+            _crestsBefore = new HashSet<int>();
+            foreach (var c in UnityEngine.Object.FindObjectsOfType<CrestHalf>())
+                _crestsBefore.Add(c.GetInstanceID());
+
+            Plugin.Log.LogInfo($"CHAOS CREATURE: Creature {_creatureId} -> Crest (crest)");
+        }
+        else
+        {
+            // Card or ingredient — let vanilla spawn happen, handle in Postfix
+            // Snapshot all objects to find the new spawn
+            _keysBefore = new HashSet<int>();
+            foreach (var k in UnityEngine.Object.FindObjectsOfType<Key>())
+                _keysBefore.Add(k.GetInstanceID());
+            _crestsBefore = new HashSet<int>();
+            foreach (var c in UnityEngine.Object.FindObjectsOfType<CrestHalf>())
+                _crestsBefore.Add(c.GetInstanceID());
+
+            Plugin.Log.LogInfo($"CHAOS CREATURE: Creature {_creatureId} -> {ChaosValidator.ItemName(chaosItem)} (card/ingredient)");
+        }
     }
 
     static void Postfix(CreatureRewardGifter __instance)
@@ -3228,7 +5991,30 @@ public class KeyRewardGifterPatch
             _originalFinalPrefab = null;
         }
 
-        if (_targetItem < 0) return;
+        // === AP mode Postfix ===
+        if (Plugin.EnableArchipelago.Value && _creatureId > 0)
+        {
+            Plugin.APClient.CheckCreatureLocation(_creatureId);
+            Plugin.Log.LogInfo($"AP CHECK: Creature {_creatureId} reward");
+            SpawnInProgress = false;
+            return;
+        }
+
+        // === Chaos mode Postfix ===
+        if (_chaosItem >= 0)
+        {
+            try
+            {
+                HandleChaosPostfixCreatureReward(__instance);
+            }
+            catch (Exception ex) { Plugin.Log.LogError($"CHAOS CREATURE ERROR: {ex.Message}\n{ex.StackTrace}"); }
+            _chaosItem = -1; _targetItem = -1; _keysBefore = null; _crestsBefore = null;
+            SpawnInProgress = false;
+            return;
+        }
+
+        // === Normal mode Postfix ===
+        if (_targetItem < 0) { SpawnInProgress = false; return; }
 
         try
         {
@@ -3301,6 +6087,106 @@ public class KeyRewardGifterPatch
         }
         Plugin.Log.LogWarning($"CREST FIX: Creature {_creatureId} -- NO NEW CREST FOUND!");
     }
+
+    static void HandleChaosPostfixCreatureReward(CreatureRewardGifter __instance)
+    {
+        if (ChaosValidator.IsKeyItem(_chaosItem))
+        {
+            // Key spawned by vanilla mechanism — fix the DoorLockID
+            int doorId = ChaosValidator.KeyDoorIds[_chaosItem - ChaosValidator.ITEM_KEY_BASE];
+            if (_keysBefore != null)
+            {
+                foreach (var key in UnityEngine.Object.FindObjectsOfType<Key>())
+                {
+                    if (!_keysBefore.Contains(key.GetInstanceID()))
+                    {
+                        key.m_KeyID = (DoorLockID)doorId;
+                        KeyRandomizer.AlreadyRemappedKeys.Add(key.GetInstanceID());
+                        Plugin.Log.LogInfo($"CHAOS CREATURE POST: Creature {_creatureId} key -> DoorLockID {doorId}");
+                        return;
+                    }
+                }
+                Plugin.Log.LogWarning($"CHAOS CREATURE POST: Creature {_creatureId} -- no new key found for DoorLockID {doorId}");
+            }
+        }
+        else if (ChaosValidator.IsCrestItem(_chaosItem))
+        {
+            // Crest spawned by vanilla mechanism — fix the side
+            if (_crestsBefore != null)
+            {
+                foreach (var crest in UnityEngine.Object.FindObjectsOfType<CrestHalf>())
+                {
+                    if (!_crestsBefore.Contains(crest.GetInstanceID()))
+                    {
+                        var newSide = KeyRandomizer.NextCrestSide();
+                        crest.m_CrestSide = newSide;
+                        CrestHalfSwapPatch.TrackConverted(crest.GetInstanceID());
+                        Plugin.Log.LogInfo($"CHAOS CREATURE POST: Creature {_creatureId} crest -> {newSide}");
+                        return;
+                    }
+                }
+                Plugin.Log.LogWarning($"CHAOS CREATURE POST: Creature {_creatureId} -- no new crest found");
+            }
+        }
+        else if (ChaosValidator.IsCardItem(_chaosItem))
+        {
+            // Vanilla spawned a key/crest — destroy it, auto-grant the card instead
+            DestroyVanillaSpawn();
+
+            int recipeIdx = _chaosItem - ChaosValidator.ITEM_CARD_BASE;
+            Plugin.ChaosRando.CollectCard(recipeIdx);
+
+            string recipeName = RecipeLogic.Recipes[recipeIdx].Name;
+            var allCards = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+            var cardData = allCards?.FirstOrDefault(c => c.GetRecipeTitle() == recipeName);
+            if (cardData != null)
+                RecipeCard.RecipeCardFoundEvent?.Invoke(cardData);
+
+            Plugin.Log.LogInfo($"CHAOS CREATURE POST: Creature {_creatureId} -> {recipeName} (card auto-granted)");
+        }
+        else if (ChaosValidator.IsIngredientItem(_chaosItem))
+        {
+            // Vanilla spawned a key/crest — destroy it, spawn ingredient at creature position
+            var spawnPos = __instance.transform.position + Vector3.up * 0.5f;
+            var spawnRot = __instance.transform.rotation;
+            DestroyVanillaSpawn();
+
+            int typeId = ChaosValidator.IngredientTypeIds[_chaosItem - ChaosValidator.ITEM_ING_BASE];
+            RecipeCardStartPatch.SpawnIngredientAtPosition(spawnPos, spawnRot, typeId,
+                $"Creature {_creatureId} reward");
+
+            Plugin.Log.LogInfo($"CHAOS CREATURE POST: Creature {_creatureId} -> {IngredientRandomizer.TypeToName.GetValueOrDefault(typeId, "?")} (ingredient spawned)");
+        }
+    }
+
+    /// <summary>Find and destroy the item that vanilla just spawned.</summary>
+    static void DestroyVanillaSpawn()
+    {
+        // Try to find the newly spawned key
+        if (_keysBefore != null)
+        {
+            foreach (var key in UnityEngine.Object.FindObjectsOfType<Key>())
+            {
+                if (!_keysBefore.Contains(key.GetInstanceID()))
+                {
+                    UnityEngine.Object.Destroy(key.gameObject);
+                    return;
+                }
+            }
+        }
+        // Try to find the newly spawned crest
+        if (_crestsBefore != null)
+        {
+            foreach (var crest in UnityEngine.Object.FindObjectsOfType<CrestHalf>())
+            {
+                if (!_crestsBefore.Contains(crest.GetInstanceID()))
+                {
+                    UnityEngine.Object.Destroy(crest.gameObject);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 [HarmonyPatch(typeof(CrowMovement), nameof(CrowMovement.Start))]
@@ -3308,6 +6194,12 @@ public class CrowRewardPatch
 {
     static void Postfix(CrowMovement __instance)
     {
+        if (Plugin.EnableChaosMode.Value)
+        {
+            HandleChaosCrowReward(__instance);
+            return;
+        }
+
         if (!Plugin.EnableKeyShuffle.Value || !Plugin.EnablePantryShuffle.Value) return;
 
         Plugin.KeyRando.Initialize();
@@ -3325,8 +6217,6 @@ public class CrowRewardPatch
 
         if (isCrestTarget)
         {
-            // Crow should give a CrestHalf, need to swap prefab
-            // Cache crest prefab from scene first
             KeyRewardGifterPatch.EnsurePrefabsCached();
             var crestPrefab = KeyRewardGifterPatch.CachedCrestPrefab;
             if (crestPrefab != null)
@@ -3339,15 +6229,26 @@ public class CrowRewardPatch
         }
         else if (KeyRandomizer.IsKey(crowItem))
         {
-            // Crow gives a Key — the vanilla reward is already a Key prefab (Fridge).
-            // The DoorLockID will be fixed when KeyUseRemapPatch fires on use.
-            // But let's also fix it at spawn via Key.Start for immediate visual correctness.
             var keyComp = reward.GetComponent<Key>();
             if (keyComp != null)
             {
                 Plugin.Log.LogInfo($"CROW PATCH: Crow reward is Key (vanilla Fridge), will remap {(int)keyComp.GetKeyID()} -> {crowItem} on use");
             }
         }
+    }
+
+    static void HandleChaosCrowReward(CrowMovement __instance)
+    {
+        if (!Plugin.ChaosRando.HasMapping) return;
+
+        int chaosItem = Plugin.ChaosRando.GetItemAtLocation(ChaosValidator.LOC_CROW);
+        if (chaosItem < 0) return;
+
+        // All chaos Crow items are handled by HandleChaosKey in KeyStartPatch.
+        // The vanilla Fridge key prefab spawns, Key.Start fires on the clone,
+        // HandleChaosKey detects it as a Crow Fridge clone and replaces/remaps it.
+        // No prefab swap needed here.
+        Plugin.Log.LogInfo($"CHAOS CROW: Reward will be {ChaosValidator.ItemName(chaosItem)} (handled via Key.Start)");
     }
 }
 
@@ -3366,6 +6267,28 @@ public class CrestHalfSwapPatch
 
     static void Postfix(CrestHalf __instance)
     {
+        if (Plugin.EnableArchipelago.Value)
+        {
+            // In AP mode, oddities check is sent on pickup via APItemPickupPatch, not here
+            // Mark non-clone crest as non-important so Lost and Found doesn't grab it
+            if (!__instance.gameObject.name.Contains("(Clone)"))
+            {
+                var item = __instance.GetComponent<Item>();
+                if (item != null)
+                {
+                    item.m_bImportantItem = false;
+                    item.m_bRespawnable = false;
+                }
+            }
+            return;
+        }
+
+        if (Plugin.EnableChaosMode.Value)
+        {
+            HandleChaosCrest(__instance);
+            return;
+        }
+
         if (!Plugin.EnableKeyShuffle.Value || !Plugin.EnablePantryShuffle.Value) return;
 
         // Skip crests already assigned a progressive side by KeyStartPatch or FixCrestSide
@@ -3421,6 +6344,76 @@ public class CrestHalfSwapPatch
         }
         catch (Exception ex) { Plugin.Log.LogError($"CREST SWAP ODDITIES ERROR: {ex.Message}"); }
     }
+
+    static void HandleChaosCrest(CrestHalf __instance)
+    {
+        if (!Plugin.ChaosRando.HasMapping) return;
+
+        // Skip crests already handled by other chaos patches (creature rewards)
+        if (_convertedCrestIds.Contains(__instance.GetInstanceID())) return;
+
+        bool isClone = __instance.gameObject.name.Contains("(Clone)");
+
+        // Clones in chaos mode come from creature reward spawns (handled by
+        // KeyRewardGifterPatch chaos postfix). Skip them.
+        if (isClone) return;
+
+        // Non-clone: this is the Oddities Room puzzle crest
+        int chaosItem = Plugin.ChaosRando.GetOdditiesItem();
+        if (chaosItem < 0) return;
+
+        var go = __instance.gameObject;
+        var pos = go.transform.position;
+        var rot = go.transform.rotation;
+
+        try
+        {
+            if (ChaosValidator.IsCrestItem(chaosItem))
+            {
+                // Crest at oddities (same as vanilla) — assign progressive side
+                var newSide = KeyRandomizer.NextCrestSide();
+                __instance.m_CrestSide = newSide;
+                CrestHalfSwapPatch.TrackConverted(__instance.GetInstanceID());
+                Plugin.Log.LogInfo($"CHAOS ODDITIES: Crest -> {newSide} (progressive)");
+            }
+            else if (ChaosValidator.IsKeyItem(chaosItem))
+            {
+                int doorId = ChaosValidator.KeyDoorIds[chaosItem - ChaosValidator.ITEM_KEY_BASE];
+                var key = go.AddComponent<Key>();
+                key.m_KeyID = (DoorLockID)doorId;
+                var item = go.GetComponent<Item>();
+                if (item != null) item.m_SecondaryFunctionality = key;
+                UnityEngine.Object.Destroy(__instance);
+                KeyRandomizer.AlreadyRemappedKeys.Add(key.GetInstanceID());
+                Plugin.Log.LogInfo($"CHAOS ODDITIES: Crest -> {KeyRandomizer.ItemName(doorId)} (key)");
+            }
+            else if (ChaosValidator.IsCardItem(chaosItem))
+            {
+                int recipeIdx = chaosItem - ChaosValidator.ITEM_CARD_BASE;
+                Plugin.ChaosRando.CollectCard(recipeIdx);
+                string recipeName = RecipeLogic.Recipes[recipeIdx].Name;
+
+                var allCards = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+                var cardData = allCards?.FirstOrDefault(c => c.GetRecipeTitle() == recipeName);
+                if (cardData != null)
+                    RecipeCard.RecipeCardFoundEvent?.Invoke(cardData);
+
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS ODDITIES: Crest -> {recipeName} (card auto-granted)");
+            }
+            else if (ChaosValidator.IsIngredientItem(chaosItem))
+            {
+                int typeId = ChaosValidator.IngredientTypeIds[chaosItem - ChaosValidator.ITEM_ING_BASE];
+                RecipeCardStartPatch.SpawnIngredientAtPosition(pos, rot, typeId, "Oddities");
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS ODDITIES: Crest -> {IngredientRandomizer.TypeToName.GetValueOrDefault(typeId, "?")} (ingredient)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"CHAOS ODDITIES ERROR: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
 }
 
 [HarmonyPatch(typeof(CreatureRewardSpawner), nameof(CreatureRewardSpawner.Start))]
@@ -3429,6 +6422,7 @@ public class KeySpawnerInitPatch
     static void Postfix(CreatureRewardSpawner __instance)
     {
         if (!Plugin.EnableKeyShuffle.Value) return;
+        if (Plugin.EnableChaosMode.Value) return;
         Plugin.KeyRando.Initialize();
     }
 }
@@ -3439,6 +6433,7 @@ public class KeyUseRemapPatch
     static void Prefix(Key __instance)
     {
         if (!Plugin.EnableKeyShuffle.Value) return;
+        if (Plugin.EnableChaosMode.Value) return;
         if (KeyRandomizer.AlreadyRemappedKeys.Contains(__instance.GetInstanceID())) return;
 
         int cur = (int)__instance.GetKeyID();
@@ -3458,11 +6453,174 @@ public class KeyUseRemapPatch
 [HarmonyPatch(typeof(ItemUnlockable), nameof(ItemUnlockable.OnItemPickedUp))]
 public class IngredientDebugPatch
 {
-    static void Prefix(ItemUnlockable __instance)
+    static HashSet<int> _mushroomDiscoveriesSent = new();
+    public static void Reset() { _mushroomDiscoveriesSent.Clear(); }
+
+    static bool Prefix(ItemUnlockable __instance, Item _pickedUpItem)
     {
+        // OnItemPickedUp is a global event — every ItemUnlockable responds.
+        // Only process if the picked-up item belongs to THIS component.
+        if (__instance.m_Item == null || _pickedUpItem == null) return true;
+        if (__instance.m_Item.GetInstanceID() != _pickedUpItem.GetInstanceID()) return true;
+
         string obj = __instance.gameObject.name;
         string parent = __instance.transform.parent != null ? __instance.transform.parent.gameObject.name : "no parent";
         Plugin.Log.LogInfo($"INGREDIENT: '{__instance.m_UnlockableItemID}' on '{obj}' under '{parent}'");
+
+        if (!Plugin.EnableArchipelago.Value) return true; // Run original
+
+        // Bypass: AP is granting this ingredient, let OnItemPickedUp run normally
+        if (Plugin.APClient.GrantingFromAP) return true;
+
+        int type = (int)__instance.GetUnlockItemID();
+        if (type <= 0) return true;
+
+        // Allow infinite sources (Pantry/Fridge/Freezer) to work normally
+        if (IngredientSwapPatch.IsInfiniteSpawnSource(__instance.transform)) return true;
+
+        // Mushrooms: send discovery check (once per type)
+        if (type == 6 || (type >= 25 && type <= 28))
+        {
+            if (_mushroomDiscoveriesSent.Add(type))
+            {
+                Plugin.APClient.CheckMushroomDiscovery(type);
+                Plugin.Log.LogInfo($"AP CHECK: Mushroom discovery type {type}");
+            }
+            return false; // Suppress original — don't discover mushroom normally
+        }
+
+        // Pinned types (Rose=19, Cereal=23) — not in AP pool, let game handle normally.
+        // Discovery adds them to pantry rotation so player can get more copies.
+        // Register with AP client so pantry hide code knows they're discovered.
+        if (IngredientRandomizer.PinnedTypes.Contains(type))
+        {
+            Plugin.APClient.RegisterPinnedTypeDiscovered(type);
+            Plugin.Log.LogInfo($"AP: Pinned type {type} discovered via physical pickup");
+            return true;
+        }
+
+        // Regular ingredient: send check, suppress normal discovery
+        Plugin.APClient.CheckIngredientPickup(type);
+        Plugin.Log.LogInfo($"AP CHECK: Ingredient pickup type {type}");
+        return false; // Suppress original — don't unlock ingredient normally
+    }
+}
+
+// =====================================================================
+// AP Crest Door Interact — When player interacts with the crest door,
+// check if all conditions are met and open it immediately.
+// Catches the case where the last creature reward arrives while the
+// player is already standing at the door.
+// =====================================================================
+[HarmonyPatch(typeof(CrestDoor), nameof(CrestDoor.DoorInteract))]
+public class APCrestDoorInteractPatch
+{
+    static void Postfix(CrestDoor __instance)
+    {
+        if (!Plugin.EnableArchipelago.Value) return;
+
+        var client = Plugin.APClient;
+        if (client == null || !client.IsConnected) return;
+        if (!client.CrestDoorRequirementsMet()) return;
+
+        // All conditions met — force the unlock now
+        Plugin.Log.LogInfo($"AP CREST INTERACT: Player interacted with crest door — all requirements met, unlocking!");
+        client.ForceUnlockCrestDoor();
+    }
+}
+
+// =====================================================================
+// AP Goal — Hook credits to send goal complete
+// StartCreditsSequence is inlined by IL2CPP, so we hook Start() which
+// is what Unity actually calls. _goalSent prevents double-fire.
+// =====================================================================
+[HarmonyPatch(typeof(EndCreditsSequence), "Start")]
+public class APCreditsStartPatch
+{
+    static void Postfix(EndCreditsSequence __instance)
+    {
+        if (!Plugin.EnableArchipelago.Value) return;
+        Plugin.Log.LogInfo("AP: EndCreditsSequence.Start fired — sending goal complete");
+        Plugin.APClient.OnGameComplete();
+    }
+}
+
+[HarmonyPatch(typeof(EndCreditsSequence), nameof(EndCreditsSequence.StartCreditsSequence))]
+public class APCreditsGoalPatch
+{
+    static void Postfix()
+    {
+        if (!Plugin.EnableArchipelago.Value) return;
+        Plugin.Log.LogInfo("AP: EndCreditsSequence.StartCreditsSequence fired — sending goal complete");
+        Plugin.APClient.OnGameComplete();
+    }
+}
+
+// =====================================================================
+// Recipesanity — Track unique recipes cooked as AP checks
+// Runs after MistakeIfNotCollectedPatch so __result reflects actual output
+// =====================================================================
+[HarmonyPatch(typeof(RecipeMasterList), nameof(RecipeMasterList.GetCreatedMeal))]
+[HarmonyPriority(Priority.Low)]
+public class RecipesanityCookPatch
+{
+    static void Postfix(ref RecipeData __result)
+    {
+        if (!Plugin.EnableArchipelago.Value) return;
+        if (__result == null) return;
+        Plugin.APClient.CheckRecipeCooked(__result);
+    }
+}
+
+// =====================================================================
+// AP Item Pickup Patch — Detects when player picks up table key / oddities crest
+// =====================================================================
+[HarmonyPatch(typeof(Item), nameof(Item.SetItemHeld))]
+public class APItemPickupPatch
+{
+    static HashSet<int> _checkedIds = new();
+    public static void Reset() { _checkedIds.Clear(); }
+
+    static void Postfix(Item __instance)
+    {
+        if (!Plugin.EnableArchipelago.Value) return;
+
+        int instanceId = __instance.GetInstanceID();
+        if (_checkedIds.Contains(instanceId)) return;
+
+        var go = __instance.gameObject;
+
+        // Table key: Pantry key (DoorLockID 4), non-clone
+        var key = go.GetComponent<Key>();
+        if (key != null)
+        {
+            int doorId = (int)key.GetKeyID();
+            if (doorId == KeyRandomizer.PANTRY && !go.name.Contains("(Clone)"))
+            {
+                _checkedIds.Add(instanceId);
+                Plugin.APClient.CheckTableLocation();
+                Plugin.Log.LogInfo("AP CHECK: Starting Table (player picked up Pantry key)");
+
+                Item.ClearHeldItem();
+                go.SetActive(false);
+                UnityEngine.Object.Destroy(go, 0.1f);
+                return;
+            }
+        }
+
+        // Oddities crest: non-clone CrestHalf
+        var crest = go.GetComponent<CrestHalf>();
+        if (crest != null && !go.name.Contains("(Clone)"))
+        {
+            _checkedIds.Add(instanceId);
+            Plugin.APClient.CheckOdditiesLocation();
+            Plugin.Log.LogInfo("AP CHECK: Oddities Puzzle (player picked up crest)");
+
+            Item.ClearHeldItem();
+            go.SetActive(false);
+            UnityEngine.Object.Destroy(go, 0.1f);
+            return;
+        }
     }
 }
 
@@ -3497,6 +6655,51 @@ public class IngredientSwapPatch
 
     static void Postfix(ItemUnlockable __instance)
     {
+        // Diagnostic: log cereal spawns to track phantom pantry cereal
+        int debugType = (int)__instance.GetUnlockItemID();
+        if (debugType == 23) // Cereal
+        {
+            string obj = __instance.gameObject.name;
+            string parent = __instance.transform.parent != null ? __instance.transform.parent.gameObject.name : "no parent";
+            bool forceSpawn = __instance.m_bForceSpawn;
+            bool isUnlocked = false;
+            try { isUnlocked = __instance.IsUnlocked(); } catch { }
+            bool inPantry = IsInfiniteSpawnSource(__instance.transform);
+
+            string ingUnlocked = "???";
+            try
+            {
+                var settings = UnityEngine.Object.FindObjectOfType<GlobalPlayerSettings>();
+                if (settings != null && settings.m_SaveData != null)
+                    ingUnlocked = settings.m_SaveData.m_IngredientsUnlocked ?? "(null)";
+            }
+            catch { }
+
+            Plugin.Log.LogWarning($"CEREAL SPAWN DEBUG: '{obj}' under '{parent}', ForceSpawn={forceSpawn}, IsUnlocked={isUnlocked}, InPantry={inPantry}, m_IngredientsUnlocked='{ingUnlocked}'");
+        }
+
+        // AP mode: hide items in pantry/fridge/freezer unless AP has granted that type.
+        // Can't trust IsUnlocked() — the game's runtime state gets polluted when
+        // ItemUnlockedEvent fires for other ingredients via GrantIngredientUnlock.
+        if (Plugin.EnableArchipelago.Value && debugType > 0)
+        {
+            if (IsInfiniteSpawnSource(__instance.transform))
+            {
+                if (!Plugin.APClient.HasIngredientType(debugType))
+                {
+                    __instance.gameObject.SetActive(false);
+                }
+            }
+        }
+
+        if (Plugin.EnableArchipelago.Value) return; // AP mode: world stays vanilla
+
+        if (Plugin.EnableChaosMode.Value)
+        {
+            HandleChaosIngredientSpot(__instance);
+            return;
+        }
+
         if (!Plugin.EnableIngredientShuffle.Value) return;
 
         int instanceId = __instance.GetInstanceID();
@@ -3527,5 +6730,94 @@ public class IngredientSwapPatch
         if (newType <= 0 || newType == origType) return;
 
         IngredientRandomizer.ApplyVisualSwap(__instance.gameObject, newType, origType);
+    }
+
+    static void HandleChaosIngredientSpot(ItemUnlockable __instance)
+    {
+        if (!Plugin.ChaosRando.HasMapping) return;
+
+        int instanceId = __instance.GetInstanceID();
+        if (_alreadySwapped.Contains(instanceId)) return;
+        _alreadySwapped.Add(instanceId);
+
+        int origType = (int)__instance.GetUnlockItemID();
+        if (origType <= 0) return;
+
+        // Skip mushrooms and pinned types (not in chaos pool)
+        if (origType == 6) return;
+        if (origType >= 25 && origType <= 28) return;
+        if (IngredientRandomizer.PinnedTypes.Contains(origType)) return;
+
+        // Skip Pantry/Fridge/Freezer infinite sources
+        if (IsInfiniteSpawnSource(__instance.transform)) return;
+
+        // Resolve which slot index this is
+        int slotIdx = Plugin.ChaosRando.ResolveIngredientSlotIndex(origType);
+        if (slotIdx < 0)
+        {
+            Plugin.Log.LogWarning($"CHAOS ING SPOT: Overflow for type {origType}");
+            return;
+        }
+
+        int item = Plugin.ChaosRando.GetItemAtIngredientSpot(slotIdx);
+        if (item < 0) return;
+
+        var go = __instance.gameObject;
+        var pos = go.transform.position;
+        var rot = go.transform.rotation;
+        string origName = IngredientRandomizer.TypeToName.TryGetValue(origType, out string n) ? n : $"Type{origType}";
+
+        try
+        {
+            if (ChaosValidator.IsIngredientItem(item))
+            {
+                // Ingredient → ingredient: swap type/visuals
+                int newType = ChaosValidator.IngredientTypeIds[item - ChaosValidator.ITEM_ING_BASE];
+                if (newType != origType)
+                {
+                    IngredientRandomizer.EnsureVisualsCached();
+                    IngredientRandomizer.ApplyVisualSwap(go, newType, origType);
+                    Plugin.Log.LogInfo($"CHAOS ING SPOT: {origName} -> {IngredientRandomizer.TypeToName.GetValueOrDefault(newType, "?")} (ingredient swap)");
+                }
+            }
+            else if (ChaosValidator.IsKeyItem(item))
+            {
+                int doorId = ChaosValidator.KeyDoorIds[item - ChaosValidator.ITEM_KEY_BASE];
+                RecipeCardStartPatch.SpawnKeyAtPosition(pos, rot, doorId, origName);
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS ING SPOT: {origName} -> {KeyRandomizer.ItemName(doorId)} (key at ingredient spot)");
+            }
+            else if (ChaosValidator.IsCrestItem(item))
+            {
+                RecipeCardStartPatch.SpawnCrestAtPosition(pos, rot, origName);
+                go.SetActive(false);
+                Plugin.Log.LogInfo($"CHAOS ING SPOT: {origName} -> Crest (at ingredient spot)");
+            }
+            else if (ChaosValidator.IsCardItem(item))
+            {
+                // Card at ingredient spot: auto-grant the recipe card
+                int recipeIdx = item - ChaosValidator.ITEM_CARD_BASE;
+                Plugin.ChaosRando.CollectCard(recipeIdx);
+
+                // Also grant it via the game's own system
+                string recipeName = RecipeLogic.Recipes[recipeIdx].Name;
+                var allCards = Resources.FindObjectsOfTypeAll<RecipeCardData>();
+                var cardData = allCards?.FirstOrDefault(c => c.GetRecipeTitle() == recipeName);
+                if (cardData != null)
+                {
+                    // Fire the RecipeCardFound event to update the scrapbook
+                    RecipeCard.RecipeCardFoundEvent?.Invoke(cardData);
+                    Plugin.Log.LogInfo($"CHAOS ING SPOT: {origName} -> {recipeName} (card auto-granted)");
+                }
+                else
+                    Plugin.Log.LogInfo($"CHAOS ING SPOT: {origName} -> {recipeName} (card tracked, no CardData found)");
+
+                go.SetActive(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"CHAOS ING SPOT ERROR: {ex.Message}\n{ex.StackTrace}");
+        }
     }
 }

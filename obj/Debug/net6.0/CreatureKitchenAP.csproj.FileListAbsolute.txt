@@ -87,3 +87,5 @@ C:\Users\stroo\source\repos\CreatureKitchenAP\CreatureKitchenAP\bin\Debug\net6.0
 C:\Users\stroo\source\repos\CreatureKitchenAP\CreatureKitchenAP\bin\Debug\net6.0\UnityEngine.JSONSerializeModule.dll
 C:\Users\stroo\source\repos\CreatureKitchenAP\CreatureKitchenAP\bin\Debug\net6.0\UnityEngine.SubsystemsModule.dll
 C:\Users\stroo\source\repos\CreatureKitchenAP\CreatureKitchenAP\obj\Debug\net6.0\CreatureKitchenAP.sourcelink.json
+C:\Users\stroo\source\repos\CreatureKitchenAP\CreatureKitchenAP\bin\Debug\net6.0\Archipelago.MultiClient.Net.dll
+C:\Users\stroo\source\repos\CreatureKitchenAP\CreatureKitchenAP\bin\Debug\net6.0\Newtonsoft.Json.dll
